@@ -3,7 +3,8 @@ use clap::{Parser, Subcommand};
 use computeruse::{
     Action, Button, Controller, FrameSequence, GptAstraPolicy, Key, KeyState, KeyboardController,
     KeyboardEvent, KeyboardListener, KeyboardPlaybackFilter, LinuxKeyboard, LinuxMouse, Listener,
-    MouseEvent, PlaybackFilter, Policy, Transition, extract_video_frames,
+    MouseEvent, MouseTrajectory, PlaybackFilter, Point, Policy, Transition, X11Cursor,
+    extract_video_frames,
 };
 use serde::Serialize;
 use std::fs::{self, File, OpenOptions};
@@ -14,6 +15,9 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const ESCAPE_SCAN_CODE: u16 = 1;
+const HOME_X: i16 = 960;
+const HOME_Y: i16 = 540;
+const HOME_SCREEN: usize = 0;
 
 #[derive(Parser)]
 #[command(version, about)]
@@ -196,9 +200,9 @@ fn control(command: Command) -> Result<()> {
                     .with_context(|| format!("cannot open recording at {}", input.display()))?,
             );
             let events: Vec<MouseEvent> = serde_json::from_reader(reader)?;
-            mouse
-                .home()
-                .context("cannot move mouse to the home position before playback")?;
+            calibrate_cursor("playback")?;
+            MouseTrajectory::from_events(home_point(), &events)
+                .context("recording contains an invalid mouse trajectory")?;
             mouse.play(
                 &events,
                 speed,
@@ -486,16 +490,9 @@ fn append_json_line(path: &PathBuf, value: &impl Serialize) -> Result<()> {
 }
 
 fn record(output: PathBuf) -> Result<()> {
-    // Open physical devices before creating uinput devices so recording cannot
-    // include events from the virtual mouse used for homing.
     let mut listener = Listener::new()?;
     let mut keyboard = KeyboardListener::new()?;
-    let mut mouse = Controller::new(
-        LinuxMouse::new().context("cannot create uinput device; check /dev/uinput permissions")?,
-    );
-    mouse
-        .home()
-        .context("cannot move mouse to the home position before recording")?;
+    calibrate_cursor("recording")?;
 
     let mut events = Vec::new();
     let (stop_sender, stop_receiver) = mpsc::sync_channel(1);
@@ -524,9 +521,32 @@ fn record(output: PathBuf) -> Result<()> {
     keyboard_result
         .context("keyboard listener stopped unexpectedly")?
         .context("cannot listen for Escape while recording")?;
+    MouseTrajectory::from_events(home_point(), &events)
+        .context("recorded mouse trajectory exceeds the coordinate range")?;
     let file = File::create(&output)
         .with_context(|| format!("cannot create recording at {}", output.display()))?;
     serde_json::to_writer_pretty(BufWriter::new(file), &events)?;
+    Ok(())
+}
+
+fn home_point() -> Point {
+    Point {
+        x: i32::from(HOME_X),
+        y: i32::from(HOME_Y),
+    }
+}
+
+fn calibrate_cursor(operation: &str) -> Result<()> {
+    let cursor = X11Cursor::connect(HOME_SCREEN)
+        .with_context(|| format!("cannot initialize X11 cursor for {operation}"))?;
+    let initial = cursor
+        .location()
+        .with_context(|| format!("cannot query cursor before {operation}"))?;
+    let calibrated = cursor
+        .home(HOME_X, HOME_Y)
+        .with_context(|| format!("cannot calibrate cursor before {operation}"))?;
+    eprintln!("cursor before {operation}: {initial}");
+    eprintln!("cursor calibrated for {operation}: {calibrated}");
     Ok(())
 }
 

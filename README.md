@@ -4,10 +4,11 @@
 keyboard capture and control on Ubuntu. It is a Linux-focused refactor of
 [`boppreh/mouse`](https://github.com/boppreh/mouse) and
 [`boppreh/keyboard`](https://github.com/boppreh/keyboard) that uses the
-kernel's `evdev` and `uinput` interfaces instead of Python and X11.
+kernel's `evdev` and `uinput` interfaces for capture and injection, plus X11
+for deterministic record/play cursor calibration.
 
 The kernel interfaces work in both Xorg and Wayland sessions and are suitable
-for Ubuntu 26.04. No display-server-specific automation API is required.
+for Ubuntu 26.04. Record/play cursor calibration specifically requires X11.
 
 ## Features
 
@@ -24,6 +25,7 @@ for Ubuntu 26.04. No display-server-specific automation API is required.
 ## Requirements
 
 - Linux with `evdev` and `uinput` enabled (standard in Ubuntu kernels).
+- An X11 session and a screen at least 961 by 541 pixels for mouse record/play calibration.
 - Rust 1.88 or newer to build from source.
 - FFmpeg on `PATH` for video frame extraction and visual-agent processing.
 - Read access to mouse devices under `/dev/input` for capture.
@@ -80,7 +82,7 @@ computeruse move-to 32768 32768
 # Print newline-delimited JSON events until interrupted.
 computeruse listen
 
-# Home the pointer to (0, 0), record until Escape is pressed, then home it
+# Home the pointer to X11 pixel (960, 540), record until Escape is pressed, then home it
 # again and replay twice as fast.
 computeruse record session.json
 computeruse play session.json --speed 2
@@ -95,12 +97,13 @@ computeruse keyboard-record keys.json --stop-key escape
 computeruse keyboard-play keys.json --speed 2
 ```
 
-Before capture starts, the `record` command moves the pointer to normalized
-desktop coordinate `(0, 0)`, making that position the origin for the recorded
-relative movement. The `play` command returns the pointer to the same origin
-before replaying events. Press Escape to stop recording. The Escape event is
-not included because mouse recordings contain only mouse events. A speed of `0`
-replays events without delays.
+Before capture starts, the `record` command queries the pointer through X11 and
+moves it to screen 0 pixel `(960, 540)`, making that position the origin for the
+recorded relative movement. The `play` command repeats and verifies the same
+calibration before replaying events. Both commands print the before and after
+locations in `xdotool getmouselocation` format. Press Escape to stop recording.
+The Escape event is not included because mouse recordings contain only mouse
+events. A speed of `0` replays events without delays.
 
 ## Library
 
@@ -186,10 +189,12 @@ for a separate RL trainer or replay buffer.
 ## Wayland And Coordinates
 
 Wayland intentionally does not expose a global pointer-position query. This
-project therefore records movement as relative deltas and does not provide the
-upstream `get_position()` API. `move-to` creates an absolute virtual input
-device and uses normalized coordinates, where `(0, 0)` is the upper-left and
-`(65535, 65535)` is the lower-right of the compositor's mapped desktop.
+project records movement as relative deltas. The standalone `listen`, `move`,
+and `move-to` operations still work without X11, but deterministic `record` and
+`play` initialization requires an X11 session. `move-to` creates an absolute
+virtual input device and uses normalized coordinates, where `(0, 0)` is the
+upper-left and `(65535, 65535)` is the lower-right of the compositor's mapped
+desktop.
 
 The exact mapping across multiple monitors is compositor policy. Relative
 movement is the most portable choice when exact monitor geometry is unknown.

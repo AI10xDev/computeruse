@@ -1,0 +1,4 @@
+#use the xdotool to get current cursor mouse location : xdotool getmouselocation
+#calibirate and home the  mouse cursor to (x:960 y:540 screen:0 window:1024) - for every intilization of record and play
+#use the triangulation and algibriac topology  to model mouse trajectories accurately
+#write this in rust  with X11 bindings and robust error handling.

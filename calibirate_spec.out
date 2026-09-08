@@ -1,0 +1,677 @@
+nohup: ignoring input
+Using spec: /home/opencode/computeruse/calibirate_spec
+[0m
+> build · gpt-5.6-sol
+[0m
+I’ll inspect the existing project structure and current recording/playback implementation, then add cursor homing and trajectory modeling in the smallest compatible Rust/X11 design.
+[0m# [0mTodos
+[•] Inspect repository and identify existing mouse record/play architecture
+[ ] Implement initialization homing and trajectory model with X11 bindings
+[ ] Add or update tests and verify build/runtime behavior
+[0m
+[0m✱ [0mGlob "**/*"[90m in . · 100 matches[0m
+[0m
+[0m$ [0mgit status --short
+?? calibirate_spec
+?? calibirate_spec.out
+[0m
+[0m$ [0mgit log --oneline -5
+be36d67 Confirm existing mouse homing implementation satisfies requested behavior
+1ac280a Implement targeted recording/replay fixes
+9a8dccd Reproduce and fix the empty recording list issue
+ac53ea5 Stop mouse recording with Escape
+12dcd54 Add video frame processing from file
+[0m
+[0m✱ [0mGlob "src/**/*.rs"[90m in . · 9 matches[0m
+[0m✱ [0mGlob "tests/**/*.rs"[90m in . · 0 matches[0m
+[0m→ [0mRead Cargo.toml
+[0m→ [0mRead README.md
+[0m→ [0mRead homing
+[0m→ [0mRead calibirate_spec
+[0m→ [0mRead calibirate_spec.out
+[0m→ [0mRead src/main.rs
+[0m→ [0mRead src/controller.rs
+[0m→ [0mRead src/linux.rs
+[0m→ [0mRead src/event.rs
+[0m→ [0mRead src/lib.rs
+The current implementation homes record/play to the normalized upper-left through `uinput`; it neither queries X11 nor targets `(960, 540)`. I’ll replace that command-level initialization with an X11 cursor calibrator that queries the current pointer, validates screen geometry, warps to the exact pixel, and verifies the result; recorded movement will remain an ordered edge path so replay preserves every measured delta rather than smoothing away turns.
+[0m
+[0m$ [0mcommand -v xdotool && xdotool getmouselocation
+(no output)
+[0m
+[0m$ [0mpkg-config --modversion x11
+/bin/bash: line 1: pkg-config: command not found
+[0m
+[0m✱ [0mGlob "Cargo.lock"[90m in . · 1 match[0m
+[0m✱ [0mGrep "x11|x11rb|Xlib"[90m in . · 0 matches[0m
+[0m
+[0m# [0mTodos
+[✓] Inspect repository and identify existing mouse record/play architecture
+[•] Implement initialization homing and trajectory model with X11 bindings
+[ ] Add or update tests and verify build/runtime behavior
+[0m
+I’m adding two focused components: an `x11rb`-based calibrator for screen-0 pixel coordinates, and a checked geometric trajectory type whose directed segments form the path topology and whose three-point orientation captures turns. Record and play will both calibrate to `(960, 540)` and validate the movement chain before writing or injecting events.
+[0m% [0mPatch 6 files
+[0m
+[0m# [0mTodos
+[✓] Inspect repository and identify existing mouse record/play architecture
+[✓] Implement initialization homing and trajectory model with X11 bindings
+[•] Add or update tests and verify build/runtime behavior
+[0m
+The implementation is in place. I’m compiling and running the full test/lint suite now; this will also confirm the exact `x11rb` protocol calls and catch any platform-boundary issues before I finish.
+[0m$ [0mcargo fmt --check
+Diff in /home/opencode/computeruse/src/trajectory.rs:72:
+             let ab_y = i64::from(points[1].y) - i64::from(points[0].y);
+             let bc_x = i64::from(points[2].x) - i64::from(points[1].x);
+             let bc_y = i64::from(points[2].y) - i64::from(points[1].y);
+[31m-            match (i128::from(ab_x) * i128::from(bc_y)
+(B[m[31m-                - i128::from(ab_y) * i128::from(bc_x))
+(B[m[31m-            .signum()
+(B[m[32m+            match (i128::from(ab_x) * i128::from(bc_y) - i128::from(ab_y) * i128::from(bc_x))
+(B[m[32m+                .signum()
+(B[m             {
+                 -1 => Turn::Clockwise,
+                 0 => Turn::Collinear,
+Diff in /home/opencode/computeruse/src/trajectory.rs:131:
+             dy: 0,
+             time: 0.0,
+         };
+[31m-        assert!(
+(B[m[31m-            MouseTrajectory::from_events(
+(B[m[31m-                Point {
+(B[m[31m-                    x: i32::MAX,
+(B[m[31m-                    y: 0,
+(B[m[31m-                },
+(B[m[31m-                &[event],
+(B[m[31m-            )
+(B[m[31m-            .is_err()
+(B[m[31m-        );
+(B[m[32m+        assert!(MouseTrajectory::from_events(Point { x: i32::MAX, y: 0 }, &[event],).is_err());
+(B[m     }
+ }
+ 
+Diff in /home/opencode/computeruse/src/x11.rs:29:
+ 
+ impl X11Cursor {
+     pub fn connect(screen: usize) -> Result<Self> {
+[31m-        let (connection, _) = x11rb::connect(None)
+(B[m[31m-            .context("cannot connect to X11; check DISPLAY and Xauthority")?;
+(B[m[32m+        let (connection, _) =
+(B[m[32m+            x11rb::connect(None).context("cannot connect to X11; check DISPLAY and Xauthority")?;
+(B[m         let root = connection
+             .setup()
+             .roots
+Diff in /home/opencode/computeruse/src/x11.rs:52:
+             .context("cannot send X11 pointer query")?
+             .reply()
+             .context("X11 pointer query failed")?;
+[31m-        ensure!(reply.same_screen, "pointer is not on X11 screen {}", self.screen);
+(B[m[32m+        ensure!(
+(B[m[32m+            reply.same_screen,
+(B[m[32m+            "pointer is not on X11 screen {}",
+(B[m[32m+            self.screen
+(B[m[32m+        );
+(B[m         Ok(CursorLocation {
+             x: reply.root_x,
+             y: reply.root_y,
+Diff in /home/opencode/computeruse/src/x11.rs:68:
+     pub fn home(&self, x: i16, y: i16) -> Result<CursorLocation> {
+         let screen = &self.connection.setup().roots[self.screen];
+         ensure!(
+[31m-            x >= 0 && y >= 0 && x < screen.width_in_pixels as i16 && y < screen.height_in_pixels as i16,
+(B[m[32m+            x >= 0
+(B[m[32m+                && y >= 0
+(B[m[32m+                && x < screen.width_in_pixels as i16
+(B[m[32m+                && y < screen.height_in_pixels as i16,
+(B[m             "home position ({x}, {y}) is outside X11 screen {} ({}x{})",
+             self.screen,
+             screen.width_in_pixels,
+Diff in /home/opencode/computeruse/src/x11.rs:79:
+             .context("cannot request X11 pointer warp")?
+             .check()
+             .context("X11 rejected pointer warp")?;
+[31m-        self.connection.flush().context("cannot flush X11 pointer warp")?;
+(B[m[32m+        self.connection
+(B[m[32m+            .flush()
+(B[m[32m+            .context("cannot flush X11 pointer warp")?;
+(B[m 
+         let location = self.location()?;
+         ensure!(
+[0m
+[0m$ [0mcargo test --all-targets
+Updating crates.io index
+    Blocking waiting for file lock on package cache
+     Locking 6 packages to latest Rust 1.88 compatible versions
+      Adding errno v0.3.14
+      Adding gethostname v1.1.0
+      Adding linux-raw-sys v0.12.1
+      Adding rustix v1.1.4
+      Adding x11rb v0.13.2 (available: v0.14.0)
+      Adding x11rb-protocol v0.13.2
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+   Compiling bitflags v2.13.1
+   Compiling rustix v1.1.4
+   Compiling linux-raw-sys v0.12.1
+   Compiling x11rb-protocol v0.13.2
+   Compiling nix v0.29.0
+   Compiling tower-http v0.6.11
+   Compiling reqwest v0.12.28
+   Compiling evdev v0.13.2
+   Compiling gethostname v1.1.0
+   Compiling x11rb v0.13.2
+   Compiling computeruse v0.1.0 (/home/opencode/computeruse)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 12.91s
+     Running unittests src/lib.rs (target/debug/deps/computeruse-c5611bf42b4bfcd6)
+
+running 24 tests
+test agent::tests::action_protocol_round_trips ... ok
+test agent::tests::frame_sequence_processes_every_frame_in_filename_order ... ok
+test agent::tests::accepts_fenced_policy_json ... ok
+test agent::tests::recognizes_supported_frame_types ... ok
+test agent::tests::rejects_incomplete_image_containers ... ok
+test controller::tests::click_and_double_click_preserve_order ... ok
+test controller::tests::home_moves_to_absolute_origin ... ok
+test controller::tests::playback_filter_excludes_requested_event_types ... ok
+test event::tests::button_aliases_parse ... ok
+test event::tests::events_round_trip_as_tagged_json ... ok
+test keyboard::tests::hotkey_presses_in_order_and_releases_in_reverse ... ok
+test keyboard::tests::hotkey_releases_pressed_modifiers_after_backend_failure ... ok
+test keyboard::tests::key_events_round_trip ... ok
+test keyboard::tests::playback_emits_repeat_events ... ok
+test linux::tests::combines_pointer_axes_in_one_replay_event ... ok
+test linux::tests::converts_linux_button_events ... ok
+test linux::tests::converts_linux_keyboard_events_and_repeats ... ok
+test linux::tests::ignores_unknown_linux_events ... ok
+test linux::tests::touch_release_resets_absolute_pointer_position ... ok
+test trajectory::tests::trajectory_preserves_edges_and_classifies_turns ... ok
+test trajectory::tests::trajectory_rejects_coordinate_overflow ... ok
+test video::tests::extracted_paths_only_include_numbered_png_frames ... ok
+test agent::tests::frame_source_starts_with_latest_bounded_trajectory ... ok
+test controller::tests::animated_motion_reaches_exact_destination ... ok
+
+test result: ok. 24 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+
+running 4 tests
+     Running unittests src/main.rs (target/debug/deps/computeruse-5716fe7610a4a6ad)
+     Running unittests src/bin/video-frames.rs (target/debug/deps/video_frames-b3a95acb475fe314)
+test tests::record_only_requires_an_output_path ... ok
+test tests::agent_actions_are_validated_before_execution ... ok
+test tests::agent_accepts_a_video_with_the_frame_flag ... ok
+test tests::escape_press_stops_mouse_recording ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+[0m
+[0m$ [0mcargo clippy --all-targets --all-features -- -D warnings
+Blocking waiting for file lock on package cache
+    Updating crates.io index
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+ Downloading crates ...
+  Downloaded gethostname v1.1.0
+  Downloaded x11rb v0.13.2
+  Downloaded x11rb-protocol v0.13.2
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on build directory
+    Checking bitflags v2.13.1
+    Checking linux-raw-sys v0.12.1
+    Checking x11rb-protocol v0.13.2
+    Checking nix v0.29.0
+    Checking tower-http v0.6.11
+    Checking reqwest v0.12.28
+    Checking evdev v0.13.2
+    Checking rustix v1.1.4
+    Checking gethostname v1.1.0
+    Checking x11rb v0.13.2
+    Checking computeruse v0.1.0 (/home/opencode/computeruse)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 17.38s
+[0m
+[0m% [0mPatch 2 files
+[0m
+[0m$ [0mcargo fmt && cargo fmt --check && cargo test --all-targets && cargo clippy --all-targets --all-features -- -D warnings
+Compiling computeruse v0.1.0 (/home/opencode/computeruse)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.94s
+     Running unittests src/lib.rs (target/debug/deps/computeruse-c5611bf42b4bfcd6)
+
+running 24 tests
+test agent::tests::accepts_fenced_policy_json ... ok
+test agent::tests::action_protocol_round_trips ... ok
+test agent::tests::rejects_incomplete_image_containers ... ok
+test agent::tests::recognizes_supported_frame_types ... ok
+test controller::tests::click_and_double_click_preserve_order ... ok
+test agent::tests::frame_sequence_processes_every_frame_in_filename_order ... ok
+test controller::tests::home_moves_to_absolute_origin ... ok
+test controller::tests::playback_filter_excludes_requested_event_types ... ok
+test event::tests::button_aliases_parse ... ok
+test event::tests::events_round_trip_as_tagged_json ... ok
+test keyboard::tests::hotkey_presses_in_order_and_releases_in_reverse ... ok
+test keyboard::tests::hotkey_releases_pressed_modifiers_after_backend_failure ... ok
+test keyboard::tests::key_events_round_trip ... ok
+test keyboard::tests::playback_emits_repeat_events ... ok
+test linux::tests::combines_pointer_axes_in_one_replay_event ... ok
+test linux::tests::converts_linux_button_events ... ok
+test linux::tests::converts_linux_keyboard_events_and_repeats ... ok
+test linux::tests::ignores_unknown_linux_events ... ok
+test linux::tests::touch_release_resets_absolute_pointer_position ... ok
+test trajectory::tests::trajectory_preserves_edges_and_classifies_turns ... ok
+test trajectory::tests::trajectory_rejects_coordinate_overflow ... ok
+test video::tests::extracted_paths_only_include_numbered_png_frames ... ok
+test agent::tests::frame_source_starts_with_latest_bounded_trajectory ... ok
+test controller::tests::animated_motion_reaches_exact_destination ... ok
+
+test result: ok. 24 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running unittests src/main.rs (target/debug/deps/computeruse-5716fe7610a4a6ad)
+     Running unittests src/bin/video-frames.rs (target/debug/deps/video_frames-b3a95acb475fe314)
+
+running 4 tests
+test tests::agent_actions_are_validated_before_execution ... ok
+test tests::escape_press_stops_mouse_recording ... ok
+test tests::record_only_requires_an_output_path ... ok
+test tests::agent_accepts_a_video_with_the_frame_flag ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+    Checking computeruse v0.1.0 (/home/opencode/computeruse)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.52s
+[0m
+[0m$ [0mgit status --short
+M Cargo.lock
+ M Cargo.toml
+ M README.md
+ M src/lib.rs
+ M src/main.rs
+?? calibirate_spec
+?? calibirate_spec.out
+?? src/trajectory.rs
+?? src/x11.rs
+[0m
+[0m$ [0mgit diff -- Cargo.toml Cargo.lock src/lib.rs src/main.rs src/trajectory.rs src/x11.rs README.md
+diff --git a/Cargo.lock b/Cargo.lock
+index b1b9198..8fc3c3b 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -190,6 +190,7 @@ dependencies = [
+  "reqwest",
+  "serde",
+  "serde_json",
++ "x11rb",
+ ]
+ 
+ [[package]]
+@@ -212,6 +213,16 @@ dependencies = [
+  "syn 3.0.5",
+ ]
+ 
++[[package]]
++name = "errno"
++version = "0.3.14"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
++dependencies = [
++ "libc",
++ "windows-sys 0.61.2",
++]
++
+ [[package]]
+ name = "evdev"
+ version = "0.13.2"
+@@ -294,6 +305,16 @@ dependencies = [
+  "slab",
+ ]
+ 
++[[package]]
++name = "gethostname"
++version = "1.1.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "1bd49230192a3797a9a4d6abe9b3eed6f7fa4c8a8a4947977c6f80025f92cbd8"
++dependencies = [
++ "rustix",
++ "windows-link",
++]
++
+ [[package]]
+ name = "getrandom"
+ version = "0.2.17"
+@@ -564,6 +585,12 @@ version = "0.2.189"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
+ 
++[[package]]
++name = "linux-raw-sys"
++version = "0.12.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
++
+ [[package]]
+ name = "litemap"
+ version = "0.8.3"
+@@ -816,6 +843,19 @@ version = "2.1.3"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "6b1e7f9a428571be2dc5bc0505c13fb6bf936822b894ec87abf8a08a4e51742d"
+ 
++[[package]]
++name = "rustix"
++version = "1.1.4"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "b6fe4565b9518b83ef4f91bb47ce29620ca828bd32cb7e408f0062e9930ba190"
++dependencies = [
++ "bitflags",
++ "errno",
++ "libc",
++ "linux-raw-sys",
++ "windows-sys 0.61.2",
++]
++
+ [[package]]
+ name = "rustls"
+ version = "0.23.44"
+@@ -1389,6 +1429,23 @@ dependencies = [
+  "tap",
+ ]
+ 
++[[package]]
++name = "x11rb"
++version = "0.13.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "9993aa5be5a26815fe2c3eacfc1fde061fc1a1f094bf1ad2a18bf9c495dd7414"
++dependencies = [
++ "gethostname",
++ "rustix",
++ "x11rb-protocol",
++]
++
++[[package]]
++name = "x11rb-protocol"
++version = "0.13.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "ea6fc2961e4ef194dcbfe56bb845534d0dc8098940c7e5c012a258bfec6701bd"
++
+ [[package]]
+ name = "yoke"
+ version = "0.8.3"
+diff --git a/Cargo.toml b/Cargo.toml
+index 74e28ac..ca4882a 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -18,3 +18,4 @@ evdev = "0.13"
+ reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+ serde = { version = "1.0", features = ["derive"] }
+ serde_json = "1.0"
++x11rb = "0.13"
+diff --git a/README.md b/README.md
+index d288307..7da8459 100644
+--- a/README.md
++++ b/README.md
+@@ -4,10 +4,11 @@
+ keyboard capture and control on Ubuntu. It is a Linux-focused refactor of
+ [`boppreh/mouse`](https://github.com/boppreh/mouse) and
+ [`boppreh/keyboard`](https://github.com/boppreh/keyboard) that uses the
+-kernel's `evdev` and `uinput` interfaces instead of Python and X11.
++kernel's `evdev` and `uinput` interfaces for capture and injection, plus X11
++for deterministic record/play cursor calibration.
+ 
+ The kernel interfaces work in both Xorg and Wayland sessions and are suitable
+-for Ubuntu 26.04. No display-server-specific automation API is required.
++for Ubuntu 26.04. Record/play cursor calibration specifically requires X11.
+ 
+ ## Features
+ 
+@@ -24,6 +25,7 @@ for Ubuntu 26.04. No display-server-specific automation API is required.
+ ## Requirements
+ 
+ - Linux with `evdev` and `uinput` enabled (standard in Ubuntu kernels).
++- An X11 session and a screen at least 961 by 541 pixels for mouse record/play calibration.
+ - Rust 1.88 or newer to build from source.
+ - FFmpeg on `PATH` for video frame extraction and visual-agent processing.
+ - Read access to mouse devices under `/dev/input` for capture.
+@@ -80,7 +82,7 @@ computeruse move-to 32768 32768
+ # Print newline-delimited JSON events until interrupted.
+ computeruse listen
+ 
+-# Home the pointer to (0, 0), record until Escape is pressed, then home it
++# Home the pointer to X11 pixel (960, 540), record until Escape is pressed, then home it
+ # again and replay twice as fast.
+ computeruse record session.json
+ computeruse play session.json --speed 2
+@@ -95,12 +97,13 @@ computeruse keyboard-record keys.json --stop-key escape
+ computeruse keyboard-play keys.json --speed 2
+ ```
+ 
+-Before capture starts, the `record` command moves the pointer to normalized
+-desktop coordinate `(0, 0)`, making that position the origin for the recorded
+-relative movement. The `play` command returns the pointer to the same origin
+-before replaying events. Press Escape to stop recording. The Escape event is
+-not included because mouse recordings contain only mouse events. A speed of `0`
+-replays events without delays.
++Before capture starts, the `record` command queries the pointer through X11 and
++moves it to screen 0 pixel `(960, 540)`, making that position the origin for the
++recorded relative movement. The `play` command repeats and verifies the same
++calibration before replaying events. Both commands print the before and after
++locations in `xdotool getmouselocation` format. Press Escape to stop recording.
++The Escape event is not included because mouse recordings contain only mouse
++events. A speed of `0` replays events without delays.
+ 
+ ## Library
+ 
+diff --git a/src/lib.rs b/src/lib.rs
+index 92bbb59..f563716 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -7,10 +7,13 @@ mod agent;
+ mod controller;
+ mod event;
+ mod keyboard;
++mod trajectory;
+ mod video;
+ 
+ #[cfg(target_os = "linux")]
+ mod linux;
++#[cfg(target_os = "linux")]
++mod x11;
+ 
+ pub use agent::{
+     Action, AgentDecision, Frame, FrameSequence, FrameSource, GptAstraPolicy, Policy, Transition,
+@@ -20,7 +23,10 @@ pub use event::{Button, ButtonState, MouseEvent};
+ pub use keyboard::{
+     Key, KeyState, KeyboardBackend, KeyboardController, KeyboardEvent, KeyboardPlaybackFilter,
+ };
++pub use trajectory::{MouseTrajectory, Point, Segment, TrajectoryError, Turn};
+ pub use video::extract_video_frames;
+ 
+ #[cfg(target_os = "linux")]
+ pub use linux::{KeyboardListener, LinuxKeyboard, LinuxMouse, Listener};
++#[cfg(target_os = "linux")]
++pub use x11::{CursorLocation, X11Cursor};
+diff --git a/src/main.rs b/src/main.rs
+index dfdb6db..b8b5c48 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -3,7 +3,8 @@ use clap::{Parser, Subcommand};
+ use computeruse::{
+     Action, Button, Controller, FrameSequence, GptAstraPolicy, Key, KeyState, KeyboardController,
+     KeyboardEvent, KeyboardListener, KeyboardPlaybackFilter, LinuxKeyboard, LinuxMouse, Listener,
+-    MouseEvent, PlaybackFilter, Policy, Transition, extract_video_frames,
++    MouseEvent, MouseTrajectory, PlaybackFilter, Point, Policy, Transition, X11Cursor,
++    extract_video_frames,
+ };
+ use serde::Serialize;
+ use std::fs::{self, File, OpenOptions};
+@@ -14,6 +15,9 @@ use std::thread;
+ use std::time::{Duration, SystemTime, UNIX_EPOCH};
+ 
+ const ESCAPE_SCAN_CODE: u16 = 1;
++const HOME_X: i16 = 960;
++const HOME_Y: i16 = 540;
++const HOME_SCREEN: usize = 0;
+ 
+ #[derive(Parser)]
+ #[command(version, about)]
+@@ -196,9 +200,9 @@ fn control(command: Command) -> Result<()> {
+                     .with_context(|| format!("cannot open recording at {}", input.display()))?,
+             );
+             let events: Vec<MouseEvent> = serde_json::from_reader(reader)?;
+-            mouse
+-                .home()
+-                .context("cannot move mouse to the home position before playback")?;
++            calibrate_cursor("playback")?;
++            MouseTrajectory::from_events(home_point(), &events)
++                .context("recording contains an invalid mouse trajectory")?;
+             mouse.play(
+                 &events,
+                 speed,
+@@ -486,16 +490,9 @@ fn append_json_line(path: &PathBuf, value: &impl Serialize) -> Result<()> {
+ }
+ 
+ fn record(output: PathBuf) -> Result<()> {
+-    // Open physical devices before creating uinput devices so recording cannot
+-    // include events from the virtual mouse used for homing.
+     let mut listener = Listener::new()?;
+     let mut keyboard = KeyboardListener::new()?;
+-    let mut mouse = Controller::new(
+-        LinuxMouse::new().context("cannot create uinput device; check /dev/uinput permissions")?,
+-    );
+-    mouse
+-        .home()
+-        .context("cannot move mouse to the home position before recording")?;
++    calibrate_cursor("recording")?;
+ 
+     let mut events = Vec::new();
+     let (stop_sender, stop_receiver) = mpsc::sync_channel(1);
+@@ -524,12 +521,35 @@ fn record(output: PathBuf) -> Result<()> {
+     keyboard_result
+         .context("keyboard listener stopped unexpectedly")?
+         .context("cannot listen for Escape while recording")?;
++    MouseTrajectory::from_events(home_point(), &events)
++        .context("recorded mouse trajectory exceeds the coordinate range")?;
+     let file = File::create(&output)
+         .with_context(|| format!("cannot create recording at {}", output.display()))?;
+     serde_json::to_writer_pretty(BufWriter::new(file), &events)?;
+     Ok(())
+ }
+ 
++fn home_point() -> Point {
++    Point {
++        x: i32::from(HOME_X),
++        y: i32::from(HOME_Y),
++    }
++}
++
++fn calibrate_cursor(operation: &str) -> Result<()> {
++    let cursor = X11Cursor::connect(HOME_SCREEN)
++        .with_context(|| format!("cannot initialize X11 cursor for {operation}"))?;
++    let initial = cursor
++        .location()
++        .with_context(|| format!("cannot query cursor before {operation}"))?;
++    let calibrated = cursor
++        .home(HOME_X, HOME_Y)
++        .with_context(|| format!("cannot calibrate cursor before {operation}"))?;
++    eprintln!("cursor before {operation}: {initial}");
++    eprintln!("cursor calibrated for {operation}: {calibrated}");
++    Ok(())
++}
++
+ fn is_escape_press(event: &KeyboardEvent) -> bool {
+     event.key.scan_code == ESCAPE_SCAN_CODE && event.state == KeyState::Down && !event.repeat
+ }
+[0m
+[0m$ [0mprintenv DISPLAY
+(no output)
+[0m
+[0m% [0mPatch 1 file
+[0m
+[0m$ [0mcargo fmt --check && cargo test --all-targets && cargo clippy --all-targets --all-features -- -D warnings && cargo doc --no-deps
+Finished `test` profile [unoptimized + debuginfo] target(s) in 0.11s
+     Running unittests src/lib.rs (target/debug/deps/computeruse-c5611bf42b4bfcd6)
+
+running 24 tests
+test agent::tests::accepts_fenced_policy_json ... ok
+test agent::tests::action_protocol_round_trips ... ok
+test agent::tests::frame_sequence_processes_every_frame_in_filename_order ... ok
+test agent::tests::recognizes_supported_frame_types ... ok
+test agent::tests::rejects_incomplete_image_containers ... ok
+test controller::tests::click_and_double_click_preserve_order ... ok
+test controller::tests::home_moves_to_absolute_origin ... ok
+test controller::tests::playback_filter_excludes_requested_event_types ... ok
+test event::tests::button_aliases_parse ... ok
+test event::tests::events_round_trip_as_tagged_json ... ok
+test keyboard::tests::hotkey_presses_in_order_and_releases_in_reverse ... ok
+test keyboard::tests::hotkey_releases_pressed_modifiers_after_backend_failure ... ok
+test keyboard::tests::key_events_round_trip ... ok
+test keyboard::tests::playback_emits_repeat_events ... ok
+test linux::tests::combines_pointer_axes_in_one_replay_event ... ok
+test linux::tests::converts_linux_button_events ... ok
+test linux::tests::converts_linux_keyboard_events_and_repeats ... ok
+test linux::tests::ignores_unknown_linux_events ... ok
+test linux::tests::touch_release_resets_absolute_pointer_position ... ok
+test trajectory::tests::trajectory_preserves_edges_and_classifies_turns ... ok
+test trajectory::tests::trajectory_rejects_coordinate_overflow ... ok
+test video::tests::extracted_paths_only_include_numbered_png_frames ... ok
+test agent::tests::frame_source_starts_with_latest_bounded_trajectory ... ok
+test controller::tests::animated_motion_reaches_exact_destination ... ok
+
+test result: ok. 24 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running unittests src/main.rs (target/debug/deps/computeruse-5716fe7610a4a6ad)
+
+running 4 tests
+test tests::agent_actions_are_validated_before_execution ... ok
+test tests::escape_press_stops_mouse_recording ... ok
+test tests::record_only_requires_an_output_path ... ok
+test tests::agent_accepts_a_video_with_the_frame_flag ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/video-frames.rs (target/debug/deps/video_frames-b3a95acb475fe314)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.11s
+    Checking computeruse v0.1.0 (/home/opencode/computeruse)
+ Documenting computeruse v0.1.0 (/home/opencode/computeruse)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.70s
+   Generated /home/opencode/computeruse/target/doc/computeruse/index.html and 1 other file
+[0m
+[0m# [0mTodos
+[✓] Inspect repository and identify existing mouse record/play architecture
+[✓] Implement initialization homing and trajectory model with X11 bindings
+[✓] Add or update tests and verify build/runtime behavior
+[0m
+Implemented X11-based mouse calibration and trajectory validation.
+
+- Added `x11rb` bindings in `Cargo.toml`.
+- Added `X11Cursor`, equivalent to `xdotool getmouselocation`, in `src/x11.rs`.
+- `record` and `play` now:
+  - Query the current X11 cursor location.
+  - Warp to screen 0 at `(960, 540)`.
+  - Verify the final coordinates.
+  - Report locations in `x:... y:... screen:... window:...` format.
+- Added `MouseTrajectory` in `src/trajectory.rs`:
+  - Represents movement as connected directed segments.
+  - Uses checked coordinate accumulation.
+  - Classifies turns using signed triangle orientation.
+  - Preserves every recorded movement delta during playback.
+- Added contextual errors for missing X11, invalid screens, undersized displays, rejected warps, and trajectory overflow.
+- Updated documentation for the X11 requirement.
+
+Verification completed:
+
+- `cargo fmt --check`
+- `cargo test --all-targets`: 28 tests passed
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo doc --no-deps`
+
+Live cursor calibration was not run because this environment has no `DISPLAY` configured. The implementation talks directly to X11 and does not require the `xdotool` executable.
