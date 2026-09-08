@@ -1,0 +1,2 @@
+#Use the cli flag `--frame` and refactor to input a video file format (s.a. mp4) & use the below downstream task (rust tool) pipeline  for frame-by-frame processing.
+#write a rust tool inputes a file of video format and splices into individual image files (frames)  into a output to a specified dir

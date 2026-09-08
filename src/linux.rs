@@ -162,7 +162,13 @@ impl KeyboardBackend for LinuxKeyboard {
 }
 
 pub struct Listener {
-    devices: Vec<(PathBuf, Device)>,
+    devices: Vec<(PathBuf, Device, AbsolutePosition)>,
+}
+
+#[derive(Default)]
+struct AbsolutePosition {
+    x: Option<i32>,
+    y: Option<i32>,
 }
 
 pub struct KeyboardListener {
@@ -233,7 +239,7 @@ impl Listener {
         for (path, device) in evdev::enumerate() {
             if is_mouse(&device) {
                 device.set_nonblocking(true)?;
-                devices.push((path, device));
+                devices.push((path, device, AbsolutePosition::default()));
             }
         }
         if devices.is_empty() {
@@ -246,7 +252,7 @@ impl Listener {
     }
 
     pub fn device_paths(&self) -> impl Iterator<Item = &PathBuf> {
-        self.devices.iter().map(|(path, _)| path)
+        self.devices.iter().map(|(path, _, _)| path)
     }
 
     pub fn listen(mut self, mut callback: impl FnMut(MouseEvent)) -> io::Result<()> {
@@ -268,17 +274,16 @@ impl Listener {
         mut cancelled: impl FnMut() -> bool,
     ) -> io::Result<()> {
         loop {
-            if cancelled() {
-                return Ok(());
-            }
             let mut had_event = false;
-            for (_, device) in &mut self.devices {
+            for (_, device, absolute_position) in &mut self.devices {
                 match device.fetch_events() {
                     Ok(events) => {
                         for event in events {
-                            if let Some(event) = convert_event(event.destructure()) {
+                            if let Some(event) =
+                                convert_event(event.destructure(), absolute_position)
+                            {
                                 had_event = true;
-                                if callback(event) || cancelled() {
+                                if callback(event) {
                                     return Ok(());
                                 }
                             }
@@ -288,6 +293,10 @@ impl Listener {
                     Err(error) => return Err(error),
                 }
             }
+            // Drain events already queued in this polling pass before stopping.
+            if cancelled() {
+                return Ok(());
+            }
             if !had_event {
                 thread::sleep(Duration::from_millis(2));
             }
@@ -296,10 +305,16 @@ impl Listener {
 }
 
 fn is_mouse(device: &Device) -> bool {
-    device.supported_keys().is_some_and(|keys| {
-        keys.contains(KeyCode::BTN_LEFT)
-            && (keys.contains(KeyCode::BTN_RIGHT) || keys.contains(KeyCode::BTN_MIDDLE))
-    })
+    let has_left_button = device
+        .supported_keys()
+        .is_some_and(|keys| keys.contains(KeyCode::BTN_LEFT));
+    let has_relative_position = device.supported_relative_axes().is_some_and(|axes| {
+        axes.contains(RelativeAxisCode::REL_X) && axes.contains(RelativeAxisCode::REL_Y)
+    });
+    let has_absolute_position = device.supported_absolute_axes().is_some_and(|axes| {
+        axes.contains(AbsoluteAxisCode::ABS_X) && axes.contains(AbsoluteAxisCode::ABS_Y)
+    });
+    has_left_button && (has_relative_position || has_absolute_position)
 }
 
 fn is_keyboard(device: &Device) -> bool {
@@ -338,9 +353,16 @@ fn convert_keyboard_event(event: InputEvent) -> Option<KeyboardEvent> {
     }
 }
 
-fn convert_event(event: EventSummary) -> Option<MouseEvent> {
+fn convert_event(
+    event: EventSummary,
+    absolute_position: &mut AbsolutePosition,
+) -> Option<MouseEvent> {
     let time = MouseEvent::now();
     match event {
+        EventSummary::Key(_, KeyCode::BTN_TOUCH, 0) => {
+            *absolute_position = AbsolutePosition::default();
+            None
+        }
         EventSummary::Key(_, key, value) => Some(MouseEvent::Button {
             button: key_button(key)?,
             state: if value == 0 {
@@ -371,6 +393,22 @@ fn convert_event(event: EventSummary) -> Option<MouseEvent> {
             Some(MouseEvent::Wheel {
                 delta,
                 horizontal: true,
+                time,
+            })
+        }
+        EventSummary::AbsoluteAxis(_, AbsoluteAxisCode::ABS_X, value) => {
+            let previous = absolute_position.x.replace(value)?;
+            Some(MouseEvent::Move {
+                dx: value - previous,
+                dy: 0,
+                time,
+            })
+        }
+        EventSummary::AbsoluteAxis(_, AbsoluteAxisCode::ABS_Y, value) => {
+            let previous = absolute_position.y.replace(value)?;
+            Some(MouseEvent::Move {
+                dx: 0,
+                dy: value - previous,
                 time,
             })
         }
@@ -408,7 +446,7 @@ mod tests {
     fn converts_linux_button_events() {
         let event = InputEvent::new(evdev::EventType::KEY.0, KeyCode::BTN_RIGHT.0, 1);
         assert!(matches!(
-            convert_event(event.destructure()),
+            convert_event(event.destructure(), &mut AbsolutePosition::default()),
             Some(MouseEvent::Button {
                 button: Button::Right,
                 state: ButtonState::Down,
@@ -420,7 +458,32 @@ mod tests {
     #[test]
     fn ignores_unknown_linux_events() {
         let event = InputEvent::new(evdev::EventType::SYNCHRONIZATION.0, 0, 0);
-        assert!(convert_event(event.destructure()).is_none());
+        assert!(convert_event(event.destructure(), &mut AbsolutePosition::default()).is_none());
+    }
+
+    #[test]
+    fn converts_absolute_pointer_events_to_relative_movement() {
+        let mut position = AbsolutePosition::default();
+        let first = InputEvent::new(evdev::EventType::ABSOLUTE.0, AbsoluteAxisCode::ABS_X.0, 100);
+        let second = InputEvent::new(evdev::EventType::ABSOLUTE.0, AbsoluteAxisCode::ABS_X.0, 125);
+
+        assert!(convert_event(first.destructure(), &mut position).is_none());
+        assert!(matches!(
+            convert_event(second.destructure(), &mut position),
+            Some(MouseEvent::Move { dx: 25, dy: 0, .. })
+        ));
+    }
+
+    #[test]
+    fn touch_release_resets_absolute_pointer_position() {
+        let mut position = AbsolutePosition {
+            x: Some(100),
+            y: Some(200),
+        };
+        let release = InputEvent::new(evdev::EventType::KEY.0, KeyCode::BTN_TOUCH.0, 0);
+        assert!(convert_event(release.destructure(), &mut position).is_none());
+        assert_eq!(position.x, None);
+        assert_eq!(position.y, None);
     }
 
     #[test]

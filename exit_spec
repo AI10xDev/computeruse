@@ -1,0 +1,2 @@
+#use 'esc' as the exit for the --record cli flag option
+ instead of Ctrl+C

@@ -1,0 +1,963 @@
+nohup: ignoring input
+Using spec: /home/opencode/computeruse/exit_spec
+[0m
+> build · gpt-5.6-sol
+[0m
+I’ll trace the `--record` input loop and its tests, then replace the Ctrl+C exit handling with Escape and verify the CLI behavior.
+[0m✱ [0mGrep "--record|Ctrl\+C|CTRL_C|SIGINT|record"[90m in . · 29 matches[0m
+[0m✱ [0mGlob "**/*"[90m in . · 100 matches[0m
+[0m
+[0m$ [0mgit status --short
+?? exit_spec
+?? exit_spec.out
+?? frame_spec
+?? frame_spec.out
+[0m
+[0m→ [0mRead src/main.rs[90m [offset=1, limit=330][0m
+[0m→ [0mRead src/main.rs[90m [offset=450, limit=150][0m
+[0m→ [0mRead Cargo.toml
+[0m→ [0mRead README.md[90m [offset=65, limit=50][0m
+[0m✱ [0mGlob "tests/**/*"[90m in . · 0 matches[0m
+[0m✱ [0mGlob "src/**/*"[90m in . · 9 matches[0m
+[0m
+[0m$ [0mgit log --oneline -10
+12dcd54 Add video frame processing from file
+0d45a75 update end-to-end functionality
+6d55eb5 Add gpt-Astra visual agent support
+da149c0 Update CI checkout action
+c26a81f Initial Rust mouse automation implementation
+[0m
+[0m→ [0mRead src/linux.rs[90m [offset=1, limit=320][0m
+[0m→ [0mRead src/event.rs[90m [offset=1, limit=220][0m
+[0m→ [0mRead src/keyboard.rs[90m [offset=1, limit=260][0m
+[0m
+[0m$ [0mgit show 0d45a75:src/main.rs
+use anyhow::{Context, Result, bail};
+use clap::{Parser, Subcommand};
+use computeruse::{
+    Action, Button, Controller, FrameSource, GptAstraPolicy, Key, KeyState, KeyboardController,
+    KeyboardEvent, KeyboardListener, KeyboardPlaybackFilter, LinuxKeyboard, LinuxMouse, Listener,
+    MouseEvent, PlaybackFilter, Policy, Transition,
+};
+use serde::Serialize;
+use std::fs::{self, File, OpenOptions};
+use std::io::{BufReader, BufWriter, Write};
+use std::path::PathBuf;
+use std::thread;
+use std::time::Duration;
+
+#[derive(Parser)]
+#[command(version, about)]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    Click {
+        #[arg(default_value = "left")]
+        button: Button,
+        #[arg(short, long, default_value_t = 1)]
+        count: u32,
+    },
+    Press {
+        #[arg(default_value = "left")]
+        button: Button,
+    },
+    Release {
+        #[arg(default_value = "left")]
+        button: Button,
+    },
+    Move {
+        dx: i32,
+        dy: i32,
+        #[arg(short, long, default_value_t = 0)]
+        duration_ms: u64,
+    },
+    MoveTo {
+        /// Normalized horizontal coordinate, from 0 to 65535.
+        x: u16,
+        /// Normalized vertical coordinate, from 0 to 65535.
+        y: u16,
+    },
+    Wheel {
+        delta: i32,
+        #[arg(long)]
+        horizontal: bool,
+    },
+    Listen,
+    Record {
+        output: PathBuf,
+        #[arg(long, default_value = "right")]
+        stop_button: Button,
+    },
+    Play {
+        input: PathBuf,
+        #[arg(long, default_value_t = 1.0)]
+        speed: f64,
+        #[arg(long)]
+        no_buttons: bool,
+        #[arg(long)]
+        no_movement: bool,
+        #[arg(long)]
+        no_wheel: bool,
+    },
+    KeyPress {
+        key: Key,
+    },
+    KeyRelease {
+        key: Key,
+    },
+    Hotkey {
+        /// Simultaneous keys, for example `ctrl+shift+a`.
+        keys: String,
+    },
+    KeyboardListen,
+    KeyboardRecord {
+        output: PathBuf,
+        #[arg(long, default_value = "escape")]
+        stop_key: Key,
+    },
+    KeyboardPlay {
+        input: PathBuf,
+        #[arg(long, default_value_t = 1.0)]
+        speed: f64,
+        #[arg(long)]
+        no_press: bool,
+        #[arg(long)]
+        no_release: bool,
+    },
+    /// Run the instruction-driven visual policy over screencast frames.
+    Agent {
+        #[arg(long)]
+        frames: PathBuf,
+        #[arg(long)]
+        instructions: PathBuf,
+        #[arg(long, default_value = "gpt-Astra")]
+        model: String,
+        #[arg(long, default_value_t = 3)]
+        trajectory: usize,
+        #[arg(long, default_value_t = 50)]
+        max_steps: usize,
+        #[arg(long, default_value_t = 10_000)]
+        frame_timeout_ms: u64,
+        /// Actually inject policy actions. Without this flag the agent is a dry run.
+        #[arg(long)]
+        execute: bool,
+        /// Optional JSONL transition log for evaluation or offline learning.
+        #[arg(long)]
+        trace: Option<PathBuf>,
+    },
+}
+
+fn main() -> Result<()> {
+    match Cli::parse().command {
+        Command::Listen => {
+            Listener::new()?.listen(|event| println_json(&event))?;
+            Ok(())
+        }
+        Command::Record {
+            output,
+            stop_button,
+        } => record(output, stop_button),
+        Command::KeyboardListen => {
+            KeyboardListener::new()?.listen(|event| println_json(&event))?;
+            Ok(())
+        }
+        Command::KeyboardRecord { output, stop_key } => keyboard_record(output, stop_key),
+        Command::Agent {
+            frames,
+            instructions,
+            model,
+            trajectory,
+            max_steps,
+            frame_timeout_ms,
+            execute,
+            trace,
+        } => run_agent(AgentOptions {
+            frames,
+            instructions,
+            model,
+            trajectory,
+            max_steps,
+            frame_timeout: Duration::from_millis(frame_timeout_ms),
+            execute,
+            trace,
+        }),
+        command => control(command),
+    }
+}
+
+fn control(command: Command) -> Result<()> {
+    let mut mouse = Controller::new(
+        LinuxMouse::new().context("cannot create uinput device; check /dev/uinput permissions")?,
+    );
+    match command {
+        Command::Click { button, count } => {
+            for _ in 0..count {
+                mouse.click(button)?;
+            }
+        }
+        Command::Press { button } => mouse.press(button)?,
+        Command::Release { button } => mouse.release(button)?,
+        Command::Move {
+            dx,
+            dy,
+            duration_ms: 0,
+        } => mouse.move_relative(dx, dy)?,
+        Command::Move {
+            dx,
+            dy,
+            duration_ms,
+        } => mouse.move_relative_over(dx, dy, Duration::from_millis(duration_ms))?,
+        Command::MoveTo { x, y } => mouse.move_absolute(x, y)?,
+        Command::Wheel { delta, horizontal } if horizontal => mouse.horizontal_wheel(delta)?,
+        Command::Wheel { delta, .. } => mouse.wheel(delta)?,
+        Command::Play {
+            input,
+            speed,
+            no_buttons,
+            no_movement,
+            no_wheel,
+        } => {
+            if speed < 0.0 {
+                bail!("speed must be zero or greater");
+            }
+            let reader = BufReader::new(
+                File::open(&input)
+                    .with_context(|| format!("cannot open recording at {}", input.display()))?,
+            );
+            let events: Vec<MouseEvent> = serde_json::from_reader(reader)?;
+            mouse
+                .home()
+                .context("cannot move mouse to the home position before playback")?;
+            mouse.play(
+                &events,
+                speed,
+                PlaybackFilter {
+                    buttons: !no_buttons,
+                    movement: !no_movement,
+                    wheel: !no_wheel,
+                },
+            )?;
+        }
+        Command::KeyPress { key } => KeyboardController::new(
+            LinuxKeyboard::new()
+                .context("cannot create virtual keyboard; check /dev/uinput permissions")?,
+        )
+        .press(&key)?,
+        Command::KeyRelease { key } => KeyboardController::new(
+            LinuxKeyboard::new()
+                .context("cannot create virtual keyboard; check /dev/uinput permissions")?,
+        )
+        .release(&key)?,
+        Command::Hotkey { keys } => KeyboardController::new(
+            LinuxKeyboard::new()
+                .context("cannot create virtual keyboard; check /dev/uinput permissions")?,
+        )
+        .send_hotkey(&keys)
+        .map_err(anyhow::Error::msg)?,
+        Command::KeyboardPlay {
+            input,
+            speed,
+            no_press,
+            no_release,
+        } => {
+            if speed < 0.0 {
+                bail!("speed must be zero or greater");
+            }
+            let reader = BufReader::new(
+                File::open(&input)
+                    .with_context(|| format!("cannot open recording at {}", input.display()))?,
+            );
+            let events: Vec<KeyboardEvent> = serde_json::from_reader(reader)?;
+            KeyboardController::new(
+                LinuxKeyboard::new()
+                    .context("cannot create virtual keyboard; check /dev/uinput permissions")?,
+            )
+            .play(
+                &events,
+                speed,
+                KeyboardPlaybackFilter {
+                    press: !no_press,
+                    release: !no_release,
+                },
+            )?;
+        }
+        Command::Listen
+        | Command::Record { .. }
+        | Command::KeyboardListen
+        | Command::KeyboardRecord { .. }
+        | Command::Agent { .. } => unreachable!(),
+    }
+    Ok(())
+}
+
+fn keyboard_record(output: PathBuf, stop_key: Key) -> Result<()> {
+    let mut listener = KeyboardListener::new()?;
+    let mut events = Vec::new();
+    let mut stop_pressed = false;
+    listener.listen_until(|event| {
+        if event.key.scan_code == stop_key.scan_code
+            && event.state == KeyState::Down
+            && !event.repeat
+        {
+            stop_pressed = true;
+        }
+        let stopped = stop_pressed
+            && event.key.scan_code == stop_key.scan_code
+            && event.state == KeyState::Up;
+        events.push(event);
+        stopped
+    })?;
+    events.sort_by(|left, right| left.time.total_cmp(&right.time));
+    let file = File::create(&output)
+        .with_context(|| format!("cannot create recording at {}", output.display()))?;
+    serde_json::to_writer_pretty(BufWriter::new(file), &events)?;
+    Ok(())
+}
+
+struct AgentOptions {
+    frames: PathBuf,
+    instructions: PathBuf,
+    model: String,
+    trajectory: usize,
+    max_steps: usize,
+    frame_timeout: Duration,
+    execute: bool,
+    trace: Option<PathBuf>,
+}
+
+fn run_agent(options: AgentOptions) -> Result<()> {
+    let instructions = fs::read_to_string(&options.instructions).with_context(|| {
+        format!(
+            "cannot read GUI instructions at {}",
+            options.instructions.display()
+        )
+    })?;
+    let mut frames = FrameSource::new(options.frames, options.trajectory)?;
+    let policy = GptAstraPolicy::from_env(options.model)?;
+    let mut transitions = Vec::new();
+    let mut previous_progress = 0.0;
+    let mut devices = if options.execute {
+        Some((
+            Controller::new(
+                LinuxMouse::new()
+                    .context("cannot create virtual mouse; check /dev/uinput permissions")?,
+            ),
+            KeyboardController::new(
+                LinuxKeyboard::new()
+                    .context("cannot create virtual keyboard; check /dev/uinput permissions")?,
+            ),
+        ))
+    } else {
+        None
+    };
+
+    for step in 0..options.max_steps {
+        let trajectory = frames
+            .next(options.frame_timeout)?
+            .with_context(|| format!("timed out waiting for a new frame at step {step}"))?;
+        let frame = trajectory
+            .back()
+            .expect("trajectory has a new frame")
+            .path
+            .clone();
+        let decision = policy.decide(&instructions, trajectory, &transitions)?;
+        if decision.actions.len() > 16 {
+            bail!("policy proposed more than 16 actions in one step");
+        }
+        validate_actions(&decision.actions)?;
+        if let Some((mouse, keyboard)) = &mut devices {
+            execute_actions(mouse, keyboard, &decision.actions)?;
+        }
+        let progress = decision.progress.clamp(0.0, 1.0);
+        let transition = Transition {
+            step,
+            frame,
+            actions: decision.actions,
+            progress,
+            reward: progress - previous_progress,
+            completed: decision.completed,
+            executed: options.execute,
+        };
+        previous_progress = progress;
+        println_json(&transition);
+        if let Some(path) = &options.trace {
+            append_json_line(path, &transition)?;
+        }
+        let completed = transition.completed;
+        transitions.push(transition);
+        if completed {
+            return Ok(());
+        }
+    }
+    bail!("agent reached max steps without completing the instructions")
+}
+
+fn execute_actions(
+    mouse: &mut Controller<LinuxMouse>,
+    keyboard: &mut KeyboardController<LinuxKeyboard>,
+    actions: &[Action],
+) -> Result<()> {
+    for action in actions {
+        match action {
+            Action::MouseMove { dx, dy } => mouse.move_relative(*dx, *dy)?,
+            Action::MouseMoveTo { x, y } => mouse.move_absolute(*x, *y)?,
+            Action::MouseClick { button } => mouse.click(*button)?,
+            Action::Scroll { delta, horizontal } if *horizontal => {
+                mouse.horizontal_wheel(*delta)?
+            }
+            Action::Scroll { delta, .. } => mouse.wheel(*delta)?,
+            Action::KeyTap { key } => keyboard.send_hotkey(key).map_err(anyhow::Error::msg)?,
+            Action::Hotkey { keys } => keyboard.send_hotkey(keys).map_err(anyhow::Error::msg)?,
+            Action::Wait { milliseconds } => {
+                if *milliseconds > 30_000 {
+                    bail!("policy wait action exceeds 30 seconds");
+                }
+                thread::sleep(Duration::from_millis(*milliseconds));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_actions(actions: &[Action]) -> Result<()> {
+    for action in actions {
+        match action {
+            Action::MouseMove { dx, dy }
+                if dx.unsigned_abs() > 32_767 || dy.unsigned_abs() > 32_767 =>
+            {
+                bail!("policy relative mouse movement exceeds +/-32767")
+            }
+            Action::Scroll { delta, .. } if delta.unsigned_abs() > 100 => {
+                bail!("policy scroll action exceeds +/-100")
+            }
+            Action::KeyTap { key } => {
+                validate_policy_key(key)?;
+            }
+            Action::Hotkey { keys } => {
+                let parsed = keys
+                    .split('+')
+                    .map(str::parse::<Key>)
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(anyhow::Error::msg)?;
+                if parsed.is_empty() {
+                    bail!("policy hotkey cannot be empty");
+                }
+                if let Some(key) = parsed
+                    .iter()
+                    .find(|key| !LinuxKeyboard::supports_scan_code(key.scan_code))
+                {
+                    bail!("policy key is not injectable on Linux: {key}");
+                }
+            }
+            Action::Wait { milliseconds } if *milliseconds > 30_000 => {
+                bail!("policy wait action exceeds 30 seconds")
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn validate_policy_key(value: &str) -> Result<Key> {
+    let key = value.parse::<Key>().map_err(anyhow::Error::msg)?;
+    if !LinuxKeyboard::supports_scan_code(key.scan_code) {
+        bail!("policy key is not injectable on Linux: {key}");
+    }
+    Ok(key)
+}
+
+fn append_json_line(path: &PathBuf, value: &impl Serialize) -> Result<()> {
+    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+    serde_json::to_writer(&mut file, value)?;
+    file.write_all(b"\n")?;
+    Ok(())
+}
+
+fn record(output: PathBuf, stop_button: Button) -> Result<()> {
+    // Open physical devices before creating uinput devices so recording cannot
+    // include events from the virtual mouse used for homing.
+    let mut listener = Listener::new()?;
+    let mut mouse = Controller::new(
+        LinuxMouse::new().context("cannot create uinput device; check /dev/uinput permissions")?,
+    );
+    mouse
+        .home()
+        .context("cannot move mouse to the home position before recording")?;
+
+    let mut events = Vec::new();
+    listener.listen_until(|event| {
+        let stopped = matches!(
+            event,
+            MouseEvent::Button {
+                button,
+                state: computeruse::ButtonState::Down,
+                ..
+            } if button == stop_button
+        );
+        events.push(event);
+        stopped
+    })?;
+    let file = File::create(&output)
+        .with_context(|| format!("cannot create recording at {}", output.display()))?;
+    serde_json::to_writer_pretty(BufWriter::new(file), &events)?;
+    Ok(())
+}
+
+fn println_json(event: &impl Serialize) {
+    println!(
+        "{}",
+        serde_json::to_string(event).expect("event is serializable")
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn agent_actions_are_validated_before_execution() {
+        assert!(validate_actions(&[Action::MouseMove { dx: 32_768, dy: 0 }]).is_err());
+        assert!(
+            validate_actions(&[Action::Wait {
+                milliseconds: 30_001,
+            }])
+            .is_err()
+        );
+        assert!(
+            validate_actions(&[Action::KeyTap {
+                key: "code:65535".into(),
+            }])
+            .is_err()
+        );
+        assert!(
+            validate_actions(&[
+                Action::MouseMove { dx: -32_767, dy: 1 },
+                Action::Scroll {
+                    delta: 100,
+                    horizontal: false,
+                },
+                Action::Hotkey {
+                    keys: "ctrl+a".into(),
+                },
+            ])
+            .is_ok()
+        );
+    }
+}
+[0m
+[0m$ [0mfile homing && ./homing --help
+homing: ASCII text
+/bin/bash: line 1: ./homing: Permission denied
+[0m
+[0m✱ [0mGrep "interrupted|stop-button|stop key|Escape|escape"[90m in . · 8 matches[0m
+The current mouse `record` command stops on a mouse button, while keyboard recording already supports Escape. I’m updating mouse recording to monitor the keyboard concurrently, stop on Escape release, and keep the Escape event out of the mouse recording; the obsolete `--stop-button` option and documentation will be removed.
+[0m→ [0mRead src/linux.rs[90m [offset=286, limit=150][0m
+The cleanest implementation is a cancellable mouse-listener loop plus a short-lived keyboard listener thread. This avoids terminal-specific Ctrl+C handling, exits even when the mouse is idle, and propagates keyboard device errors instead of silently hanging.
+[0m% [0mPatch 3 files
+[0m
+[0m$ [0mgit diff --check
+(no output)
+[0m
+[0m$ [0mcargo fmt -- --check
+Diff in /home/opencode/computeruse/src/main.rs:55:
+     },
+     Listen,
+     /// Record mouse events until Escape is pressed.
+[31m-    Record { output: PathBuf },
+(B[m[32m+    Record {
+(B[m[32m+        output: PathBuf,
+(B[m[32m+    },
+(B[m     Play {
+         input: PathBuf,
+         #[arg(long, default_value_t = 1.0)]
+[0m
+[0m$ [0mcargo clippy --all-targets --all-features -- -D warnings
+Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Checking computeruse v0.1.0 (/home/opencode/computeruse)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.72s
+[0m
+[0m$ [0mcargo test
+Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on build directory
+   Compiling computeruse v0.1.0 (/home/opencode/computeruse)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.81s
+     Running unittests src/lib.rs (target/debug/deps/computeruse-0b4a1abf3c1aab6f)
+
+running 20 tests
+test agent::tests::accepts_fenced_policy_json ... ok
+test agent::tests::action_protocol_round_trips ... ok
+test agent::tests::frame_sequence_processes_every_frame_in_filename_order ... ok
+test agent::tests::recognizes_supported_frame_types ... ok
+test agent::tests::rejects_incomplete_image_containers ... ok
+test controller::tests::click_and_double_click_preserve_order ... ok
+test controller::tests::home_moves_to_absolute_origin ... ok
+test controller::tests::playback_filter_excludes_requested_event_types ... ok
+test event::tests::button_aliases_parse ... ok
+test event::tests::events_round_trip_as_tagged_json ... ok
+test keyboard::tests::hotkey_presses_in_order_and_releases_in_reverse ... ok
+test keyboard::tests::hotkey_releases_pressed_modifiers_after_backend_failure ... ok
+test keyboard::tests::key_events_round_trip ... ok
+test keyboard::tests::playback_emits_repeat_events ... ok
+test linux::tests::converts_linux_button_events ... ok
+test linux::tests::converts_linux_keyboard_events_and_repeats ... ok
+test linux::tests::ignores_unknown_linux_events ... ok
+test video::tests::extracted_paths_only_include_numbered_png_frames ... ok
+test agent::tests::frame_source_starts_with_latest_bounded_trajectory ... ok
+test controller::tests::animated_motion_reaches_exact_destination ... ok
+
+test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+
+running 3 tests
+test tests::agent_actions_are_validated_before_execution ... ok
+test tests::record_only_requires_an_output_path ... ok
+test tests::agent_accepts_a_video_with_the_frame_flag ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (target/debug/deps/computeruse-47ad954a76633900)
+     Running unittests src/bin/video-frames.rs (target/debug/deps/video_frames-51a6ca56835c6287)
+   Doc-tests computeruse
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+[0m
+Compilation, tests, and Clippy pass. Formatting found one enum-layout difference; I’m applying Rustfmt, then I’ll verify the generated CLI help explicitly advertises Escape and no longer exposes `--stop-button`.
+[0m$ [0mcargo fmt
+(no output)
+[0m
+[0m$ [0mcargo run --quiet -- record --help
+error: `cargo run` could not determine which binary to run. Use the `--bin` option to specify a binary, or the `default-run` manifest key.
+available binaries: computeruse, video-frames
+[0m
+[0m$ [0mgit diff --check && git status --short
+M README.md
+ M src/linux.rs
+ M src/main.rs
+?? exit_spec
+?? exit_spec.out
+?? frame_spec
+?? frame_spec.out
+[0m
+[0m$ [0mgit diff -- src/main.rs src/linux.rs README.md
+diff --git a/README.md b/README.md
+index d793c7c..d288307 100644
+--- a/README.md
++++ b/README.md
+@@ -80,8 +80,8 @@ computeruse move-to 32768 32768
+ # Print newline-delimited JSON events until interrupted.
+ computeruse listen
+ 
+-# Home the pointer to (0, 0), record through the first right-button press,
+-# then home it again and replay twice as fast.
++# Home the pointer to (0, 0), record until Escape is pressed, then home it
++# again and replay twice as fast.
+ computeruse record session.json
+ computeruse play session.json --speed 2
+ 
+@@ -98,9 +98,9 @@ computeruse keyboard-play keys.json --speed 2
+ Before capture starts, the `record` command moves the pointer to normalized
+ desktop coordinate `(0, 0)`, making that position the origin for the recorded
+ relative movement. The `play` command returns the pointer to the same origin
+-before replaying events. Recordings include the stop event in the file,
+-matching the behavior of the original Python package. Use `--stop-button
+-middle` to select another button. A speed of `0` replays events without delays.
++before replaying events. Press Escape to stop recording. The Escape event is
++not included because mouse recordings contain only mouse events. A speed of `0`
++replays events without delays.
+ 
+ ## Library
+ 
+diff --git a/src/linux.rs b/src/linux.rs
+index 2d760b2..8776b45 100644
+--- a/src/linux.rs
++++ b/src/linux.rs
+@@ -258,7 +258,19 @@ impl Listener {
+ 
+     /// Listens until the callback returns `true`.
+     pub fn listen_until(&mut self, mut callback: impl FnMut(MouseEvent) -> bool) -> io::Result<()> {
++        self.listen_until_cancelled(&mut callback, || false)
++    }
++
++    /// Listens until the callback or cancellation predicate returns `true`.
++    pub fn listen_until_cancelled(
++        &mut self,
++        mut callback: impl FnMut(MouseEvent) -> bool,
++        mut cancelled: impl FnMut() -> bool,
++    ) -> io::Result<()> {
+         loop {
++            if cancelled() {
++                return Ok(());
++            }
+             let mut had_event = false;
+             for (_, device) in &mut self.devices {
+                 match device.fetch_events() {
+@@ -266,7 +278,7 @@ impl Listener {
+                         for event in events {
+                             if let Some(event) = convert_event(event.destructure()) {
+                                 had_event = true;
+-                                if callback(event) {
++                                if callback(event) || cancelled() {
+                                     return Ok(());
+                                 }
+                             }
+diff --git a/src/main.rs b/src/main.rs
+index 1cb9c2c..c0b95df 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -9,6 +9,7 @@ use serde::Serialize;
+ use std::fs::{self, File, OpenOptions};
+ use std::io::{BufReader, BufWriter, Write};
+ use std::path::PathBuf;
++use std::sync::mpsc;
+ use std::thread;
+ use std::time::{Duration, SystemTime, UNIX_EPOCH};
+ 
+@@ -53,10 +54,9 @@ enum Command {
+         horizontal: bool,
+     },
+     Listen,
++    /// Record mouse events until Escape is pressed.
+     Record {
+         output: PathBuf,
+-        #[arg(long, default_value = "right")]
+-        stop_button: Button,
+     },
+     Play {
+         input: PathBuf,
+@@ -125,10 +125,7 @@ fn main() -> Result<()> {
+             Listener::new()?.listen(|event| println_json(&event))?;
+             Ok(())
+         }
+-        Command::Record {
+-            output,
+-            stop_button,
+-        } => record(output, stop_button),
++        Command::Record { output } => record(output),
+         Command::KeyboardListen => {
+             KeyboardListener::new()?.listen(|event| println_json(&event))?;
+             Ok(())
+@@ -486,10 +483,11 @@ fn append_json_line(path: &PathBuf, value: &impl Serialize) -> Result<()> {
+     Ok(())
+ }
+ 
+-fn record(output: PathBuf, stop_button: Button) -> Result<()> {
++fn record(output: PathBuf) -> Result<()> {
+     // Open physical devices before creating uinput devices so recording cannot
+     // include events from the virtual mouse used for homing.
+     let mut listener = Listener::new()?;
++    let mut keyboard = KeyboardListener::new()?;
+     let mut mouse = Controller::new(
+         LinuxMouse::new().context("cannot create uinput device; check /dev/uinput permissions")?,
+     );
+@@ -498,18 +496,34 @@ fn record(output: PathBuf, stop_button: Button) -> Result<()> {
+         .context("cannot move mouse to the home position before recording")?;
+ 
+     let mut events = Vec::new();
+-    listener.listen_until(|event| {
+-        let stopped = matches!(
+-            event,
+-            MouseEvent::Button {
+-                button,
+-                state: computeruse::ButtonState::Down,
+-                ..
+-            } if button == stop_button
+-        );
+-        events.push(event);
+-        stopped
+-    })?;
++    let (stop_sender, stop_receiver) = mpsc::sync_channel(1);
++    let keyboard_thread = thread::spawn(move || {
++        let result = keyboard.listen_until(|event| {
++            event.key.scan_code == 1 && event.state == KeyState::Down && !event.repeat
++        });
++        let _ = stop_sender.send(result);
++    });
++    let mut keyboard_result = None;
++    listener.listen_until_cancelled(
++        |event| {
++            events.push(event);
++            false
++        },
++        || match stop_receiver.try_recv() {
++            Ok(result) => {
++                keyboard_result = Some(result);
++                true
++            }
++            Err(mpsc::TryRecvError::Empty) => false,
++            Err(mpsc::TryRecvError::Disconnected) => true,
++        },
++    )?;
++    keyboard_thread
++        .join()
++        .map_err(|_| anyhow::anyhow!("keyboard listener thread panicked"))?;
++    keyboard_result
++        .context("keyboard listener stopped unexpectedly")?
++        .context("cannot listen for Escape while recording")?;
+     let file = File::create(&output)
+         .with_context(|| format!("cannot create recording at {}", output.display()))?;
+     serde_json::to_writer_pretty(BufWriter::new(file), &events)?;
+@@ -573,4 +587,13 @@ mod tests {
+             Command::Agent { frame, .. } if frame == *"recording.mp4"
+         ));
+     }
++
++    #[test]
++    fn record_only_requires_an_output_path() {
++        let cli = Cli::try_parse_from(["computeruse", "record", "session.json"]).unwrap();
++        assert!(matches!(
++            cli.command,
++            Command::Record { output } if output == *"session.json"
++        ));
++    }
+ }
+[0m
+[0m$ [0mcargo test
+Compiling computeruse v0.1.0 (/home/opencode/computeruse)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.65s
+     Running unittests src/lib.rs (target/debug/deps/computeruse-0b4a1abf3c1aab6f)
+
+running 20 tests
+test agent::tests::accepts_fenced_policy_json ... ok
+test agent::tests::action_protocol_round_trips ... ok
+test agent::tests::frame_sequence_processes_every_frame_in_filename_order ... ok
+test agent::tests::recognizes_supported_frame_types ... ok
+test agent::tests::rejects_incomplete_image_containers ... ok
+test controller::tests::click_and_double_click_preserve_order ... ok
+test controller::tests::home_moves_to_absolute_origin ... ok
+test controller::tests::playback_filter_excludes_requested_event_types ... ok
+test event::tests::button_aliases_parse ... ok
+test event::tests::events_round_trip_as_tagged_json ... ok
+test keyboard::tests::hotkey_presses_in_order_and_releases_in_reverse ... ok
+test keyboard::tests::hotkey_releases_pressed_modifiers_after_backend_failure ... ok
+test keyboard::tests::key_events_round_trip ... ok
+test keyboard::tests::playback_emits_repeat_events ... ok
+test linux::tests::converts_linux_button_events ... ok
+test linux::tests::converts_linux_keyboard_events_and_repeats ... ok
+test linux::tests::ignores_unknown_linux_events ... ok
+test video::tests::extracted_paths_only_include_numbered_png_frames ... ok
+test agent::tests::frame_source_starts_with_latest_bounded_trajectory ... ok
+test controller::tests::animated_motion_reaches_exact_destination ... ok
+
+test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+
+running 3 tests
+     Running unittests src/main.rs (target/debug/deps/computeruse-47ad954a76633900)
+     Running unittests src/bin/video-frames.rs (target/debug/deps/video_frames-51a6ca56835c6287)
+test tests::agent_actions_are_validated_before_execution ... ok
+test tests::record_only_requires_an_output_path ... ok
+test tests::agent_accepts_a_video_with_the_frame_flag ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests computeruse
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+[0m
+[0m→ [0mRead docs/MIGRATION.md[90m [offset=1, limit=105][0m
+[0m✱ [0mGrep "stop_button|stop-button|right-button|Ctrl\+C|ctrl-c|SIGINT"[90m in . · 0 matches[0m
+[0m
+[0m$ [0mcargo run --quiet --bin computeruse -- record --help
+Record mouse events until Escape is pressed
+
+Usage: computeruse record <OUTPUT>
+
+Arguments:
+  <OUTPUT>  
+
+Options:
+  -h, --help  Print help
+[0m
+[0m% [0mPatch 1 file
+[0m
+[0m$ [0mgit diff --check
+(no output)
+[0m
+[0m$ [0mcargo clippy --all-targets --all-features -- -D warnings
+Blocking waiting for file lock on package cache
+    Checking computeruse v0.1.0 (/home/opencode/computeruse)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.44s
+[0m
+[0m$ [0mcargo fmt -- --check && cargo test
+Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on build directory
+   Compiling computeruse v0.1.0 (/home/opencode/computeruse)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.02s
+     Running unittests src/lib.rs (target/debug/deps/computeruse-0b4a1abf3c1aab6f)
+
+running 20 tests
+test agent::tests::accepts_fenced_policy_json ... ok
+test agent::tests::action_protocol_round_trips ... ok
+test agent::tests::frame_sequence_processes_every_frame_in_filename_order ... ok
+test agent::tests::recognizes_supported_frame_types ... ok
+test agent::tests::rejects_incomplete_image_containers ... ok
+test controller::tests::click_and_double_click_preserve_order ... ok
+test controller::tests::home_moves_to_absolute_origin ... ok
+test controller::tests::playback_filter_excludes_requested_event_types ... ok
+test event::tests::button_aliases_parse ... ok
+test event::tests::events_round_trip_as_tagged_json ... ok
+test keyboard::tests::hotkey_presses_in_order_and_releases_in_reverse ... ok
+test keyboard::tests::hotkey_releases_pressed_modifiers_after_backend_failure ... ok
+test keyboard::tests::playback_emits_repeat_events ... ok
+test keyboard::tests::key_events_round_trip ... ok
+test linux::tests::converts_linux_button_events ... ok
+test linux::tests::converts_linux_keyboard_events_and_repeats ... ok
+test linux::tests::ignores_unknown_linux_events ... ok
+test video::tests::extracted_paths_only_include_numbered_png_frames ... ok
+test agent::tests::frame_source_starts_with_latest_bounded_trajectory ... ok
+test controller::tests::animated_motion_reaches_exact_destination ... ok
+
+test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+
+running 4 tests
+     Running unittests src/main.rs (target/debug/deps/computeruse-47ad954a76633900)
+     Running unittests src/bin/video-frames.rs (target/debug/deps/video_frames-51a6ca56835c6287)
+test tests::escape_press_stops_mouse_recording ... ok
+test tests::agent_actions_are_validated_before_execution ... ok
+test tests::record_only_requires_an_output_path ... ok
+test tests::agent_accepts_a_video_with_the_frame_flag ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests computeruse
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+[0m
+Updated mouse recording to exit when `Esc` is pressed.
+
+- `computeruse record <OUTPUT>` now monitors Escape concurrently with mouse events.
+- Removed the obsolete `--stop-button` option.
+- Updated CLI help, README, and tests.
+- Added cancellable mouse-listener support for idle-mouse exits.
+
+Verification passed: `cargo test`, `cargo clippy --all-targets --all-features -- -D warnings`, and formatting checks.

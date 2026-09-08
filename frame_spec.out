@@ -1,0 +1,546 @@
+nohup: ignoring input
+Using spec: /home/opencode/computeruse/frame_spec
+[0m
+> build · gpt-5.6-sol
+[0m
+I’ll inspect the existing CLI and media-processing flow first, then wire `--frame` to a Rust frame-extraction tool while preserving the project’s current conventions.
+[0m# [0mTodos
+[•] Inspect the existing CLI, input handling, and build setup
+[ ] Implement the Rust video frame-splicing tool and connect the --frame pipeline
+[ ] Add or update tests and documentation, then verify the workflow
+[0m
+[0m✱ [0mGlob "**/*"[90m 100 matches[0m
+[0m✱ [0mGrep "--frame|frame|clap|argparse|click|commander"[90m in . · 66 matches[0m
+[0m
+[0m$ [0mgit status --short && git log --oneline -5
+?? frame_spec
+?? frame_spec.out
+0d45a75 update end-to-end functionality
+6d55eb5 Add gpt-Astra visual agent support
+da149c0 Update CI checkout action
+c26a81f Initial Rust mouse automation implementation
+[0m
+[0m→ [0mRead Cargo.toml
+[0m→ [0mRead src/main.rs
+[0m→ [0mRead README.md[90m [offset=130, limit=65][0m
+[0m→ [0mRead frame_spec
+[0m→ [0mRead frame_spec.out
+[0m→ [0mRead src/agent.rs[90m [offset=1, limit=180][0m
+The current `agent` accepts `--frames <directory>` and polls for live screenshots. I’m going to make the minimal coherent refactor: `--frame <video>` becomes the agent input, a reusable Rust extractor writes ordered PNGs to a specified directory through `ffmpeg`, and the agent consumes those extracted frames sequentially instead of waiting for directory changes.
+[0m
+[0m$ [0mffmpeg -version
+/bin/bash: line 1: ffmpeg: command not found
+[0m
+[0m→ [0mRead .gitignore
+[0m→ [0mRead README.md[90m [offset=1, limit=130][0m
+[0m→ [0mRead QUICKSTART.md
+[0m→ [0mRead src/lib.rs
+[0m
+[0m$ [0mcargo test
+Finished `test` profile [unoptimized + debuginfo] target(s) in 0.12s
+     Running unittests src/lib.rs (target/debug/deps/computeruse-0b4a1abf3c1aab6f)
+
+running 18 tests
+test agent::tests::accepts_fenced_policy_json ... ok
+test agent::tests::action_protocol_round_trips ... ok
+test agent::tests::rejects_incomplete_image_containers ... ok
+test agent::tests::recognizes_supported_frame_types ... ok
+test controller::tests::click_and_double_click_preserve_order ... ok
+test controller::tests::home_moves_to_absolute_origin ... ok
+test controller::tests::playback_filter_excludes_requested_event_types ... ok
+test event::tests::button_aliases_parse ... ok
+test event::tests::events_round_trip_as_tagged_json ... ok
+test keyboard::tests::hotkey_presses_in_order_and_releases_in_reverse ... ok
+test keyboard::tests::hotkey_releases_pressed_modifiers_after_backend_failure ... ok
+test keyboard::tests::key_events_round_trip ... ok
+test keyboard::tests::playback_emits_repeat_events ... ok
+test linux::tests::converts_linux_button_events ... ok
+test linux::tests::converts_linux_keyboard_events_and_repeats ... ok
+test linux::tests::ignores_unknown_linux_events ... ok
+test agent::tests::frame_source_starts_with_latest_bounded_trajectory ... ok
+test controller::tests::animated_motion_reaches_exact_destination ... ok
+
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running unittests src/main.rs (target/debug/deps/computeruse-47ad954a76633900)
+   Doc-tests computeruse
+
+running 1 test
+test tests::agent_actions_are_validated_before_execution ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+[0m
+[0m→ [0mRead src/agent.rs[90m [offset=330, limit=90][0m
+I’ll add a library-level extractor plus a `video-frames` binary, then use the same extractor from `computeruse agent --frame`. The implementation will invoke the system `ffmpeg` executable rather than binding native FFmpeg libraries, keeping the Rust build portable while returning clear errors when FFmpeg is missing or decoding fails.
+[0m% [0mPatch 5 files
+[0m% [0mPatch 3 files
+[0m% [0mPatch 4 files
+The CLI and pipeline are now connected. I’m verifying formatting, unit tests, both binaries’ help output, and failure behavior in this environment, where FFmpeg is intentionally absent and should produce an actionable error rather than a panic.
+[0m
+[0m# [0mTodos
+[✓] Inspect the existing CLI, input handling, and build setup
+[✓] Implement the Rust video frame-splicing tool and connect the --frame pipeline
+[•] Add or update tests and documentation, then verify the workflow
+[0m
+[0m$ [0mcargo fmt --check
+Diff in /home/opencode/computeruse/src/agent.rs:440:
+             .as_nanos();
+         let directory = std::env::temp_dir().join(format!("computeruse-sequence-{suffix}"));
+         fs::create_dir(&directory).unwrap();
+[31m-        let paths = ["frame-0000000000.png", "frame-0000000001.png"]
+(B[m[31m-            .map(|name| {
+(B[m[31m-                let path = directory.join(name);
+(B[m[31m-                fs::write(&path, fake_png(name.as_bytes()[17])).unwrap();
+(B[m[31m-                path
+(B[m[31m-            });
+(B[m[32m+        let paths = ["frame-0000000000.png", "frame-0000000001.png"].map(|name| {
+(B[m[32m+            let path = directory.join(name);
+(B[m[32m+            fs::write(&path, fake_png(name.as_bytes()[17])).unwrap();
+(B[m[32m+            path
+(B[m[32m+        });
+(B[m 
+         let mut source = FrameSequence::new(paths, 1).unwrap();
+         assert!(
+Diff in /home/opencode/computeruse/src/main.rs:338:
+     let frame_output = options
+         .frame_output
+         .as_deref()
+[31m-        .or_else(|| temporary_frames.as_ref().map(|directory| directory.path.as_path()))
+(B[m[32m+        .or_else(|| {
+(B[m[32m+            temporary_frames
+(B[m[32m+                .as_ref()
+(B[m[32m+                .map(|directory| directory.path.as_path())
+(B[m[32m+        })
+(B[m         .expect("a persistent or temporary frame output exists");
+     let paths = extract_video_frames(&options.frame, frame_output)?;
+     let mut frames = FrameSequence::new(paths, options.trajectory)?;
+[0m
+[0m$ [0mcargo fmt
+(no output)
+[0m
+[0m$ [0mcargo test
+Compiling computeruse v0.1.0 (/home/opencode/computeruse)
+error[E0432]: unresolved import `computeruse::extract_video_frames`
+ --> src/bin/video-frames.rs:3:5
+  |
+3 | use computeruse::extract_video_frames;
+  |     ^^^^^^^^^^^^^--------------------
+  |                  |
+  |                  no `extract_video_frames` in the root
+
+For more information about this error, try `rustc --explain E0432`.
+error[E0432]: unresolved import `computeruse::extract_video_frames`
+ --> src/main.rs:6:53
+  |
+6 |     MouseEvent, PlaybackFilter, Policy, Transition, extract_video_frames,
+  |                                                     ^^^^^^^^^^^^^^^^^^^^ no `extract_video_frames` in the root
+
+error: could not compile `computeruse` (bin "video-frames" test) due to 1 previous error
+warning: build failed, waiting for other jobs to finish...
+error: could not compile `computeruse` (bin "computeruse" test) due to 1 previous error
+[0m
+[0m$ [0mcargo run --quiet --bin computeruse -- agent --help
+error[E0432]: unresolved import `computeruse::extract_video_frames`
+ --> src/main.rs:6:53
+  |
+6 |     MouseEvent, PlaybackFilter, Policy, Transition, extract_video_frames,
+  |                                                     ^^^^^^^^^^^^^^^^^^^^ no `extract_video_frames` in the root
+
+For more information about this error, try `rustc --explain E0432`.
+error: could not compile `computeruse` (bin "computeruse") due to 1 previous error
+[0m
+[0m$ [0mcargo run --quiet --bin video-frames -- --help
+error[E0432]: unresolved import `computeruse::extract_video_frames`
+ --> src/bin/video-frames.rs:3:5
+  |
+3 | use computeruse::extract_video_frames;
+  |     ^^^^^^^^^^^^^--------------------
+  |                  |
+  |                  no `extract_video_frames` in the root
+
+For more information about this error, try `rustc --explain E0432`.
+error: could not compile `computeruse` (bin "video-frames") due to 1 previous error
+[0m
+[0m$ [0mcargo clippy --all-targets -- -D warnings
+Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on build directory
+    Checking computeruse v0.1.0 (/home/opencode/computeruse)
+error: method `next` can be confused for the standard trait method `std::iter::Iterator::next`
+   --> src/agent.rs:137:5
+    |
+137 | /     pub fn next(&mut self) -> Result<Option<&VecDeque<Frame>>> {
+138 | |         let Some(path) = self.paths.pop_front() else {
+139 | |             return Ok(None);
+140 | |         };
+...   |
+153 | |         Ok(Some(&self.trajectory))
+154 | |     }
+    | |_____^
+    |
+    = help: consider implementing the trait `std::iter::Iterator` or choosing a less ambiguous method name
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#should_implement_trait
+    = note: `-D clippy::should-implement-trait` implied by `-D warnings`
+    = help: to override `-D warnings` add `#[allow(clippy::should_implement_trait)]`
+
+error: could not compile `computeruse` (lib) due to 1 previous error
+warning: build failed, waiting for other jobs to finish...
+error: could not compile `computeruse` (lib test) due to 1 previous error
+[0m
+[0m→ [0mRead src/lib.rs
+Verification found two compile-time integration issues: the video module export was dropped by an overlapping patch, and Clippy correctly rejected naming the finite source method `next` without implementing `Iterator`. I’m correcting both without changing behavior, then rerunning the full checks.
+[0m% [0mPatch 3 files
+[0m✱ [0mGrep "source\.next\(\)|frames\.next\(\)"[90m in src · 0 matches[0m
+[0m
+[0m$ [0mcargo fmt --check
+Diff in /home/opencode/computeruse/src/video.rs:14:
+     let input = input.as_ref();
+     let output = output.as_ref();
+     if !input.is_file() {
+[31m-        bail!("video input does not exist or is not a file: {}", input.display());
+(B[m[32m+        bail!(
+(B[m[32m+            "video input does not exist or is not a file: {}",
+(B[m[32m+            input.display()
+(B[m[32m+        );
+(B[m     }
+     fs::create_dir_all(output)
+         .with_context(|| format!("cannot create frame output directory {}", output.display()))?;
+[0m
+[0m$ [0mcargo fmt
+(no output)
+[0m
+[0m$ [0mcargo test
+Blocking waiting for file lock on package cache
+   Compiling computeruse v0.1.0 (/home/opencode/computeruse)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.79s
+     Running unittests src/lib.rs (target/debug/deps/computeruse-0b4a1abf3c1aab6f)
+
+running 20 tests
+test agent::tests::accepts_fenced_policy_json ... ok
+test agent::tests::action_protocol_round_trips ... ok
+test agent::tests::rejects_incomplete_image_containers ... ok
+test agent::tests::recognizes_supported_frame_types ... ok
+test agent::tests::frame_sequence_processes_every_frame_in_filename_order ... ok
+test controller::tests::click_and_double_click_preserve_order ... ok
+test controller::tests::playback_filter_excludes_requested_event_types ... ok
+test event::tests::button_aliases_parse ... ok
+test event::tests::events_round_trip_as_tagged_json ... ok
+test controller::tests::home_moves_to_absolute_origin ... ok
+test keyboard::tests::hotkey_presses_in_order_and_releases_in_reverse ... ok
+test keyboard::tests::hotkey_releases_pressed_modifiers_after_backend_failure ... ok
+test keyboard::tests::key_events_round_trip ... ok
+test keyboard::tests::playback_emits_repeat_events ... ok
+test linux::tests::converts_linux_button_events ... ok
+test linux::tests::converts_linux_keyboard_events_and_repeats ... ok
+test linux::tests::ignores_unknown_linux_events ... ok
+test video::tests::extracted_paths_only_include_numbered_png_frames ... ok
+test agent::tests::frame_source_starts_with_latest_bounded_trajectory ... ok
+test controller::tests::animated_motion_reaches_exact_destination ... ok
+
+test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running unittests src/main.rs (target/debug/deps/computeruse-47ad954a76633900)
+
+running 2 tests
+test tests::agent_actions_are_validated_before_execution ... ok
+test tests::agent_accepts_a_video_with_the_frame_flag ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/video-frames.rs (target/debug/deps/video_frames-51a6ca56835c6287)
+   Doc-tests computeruse
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+[0m
+[0m$ [0mcargo clippy --all-targets -- -D warnings
+Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on build directory
+    Checking computeruse v0.1.0 (/home/opencode/computeruse)
+error: this creates an owned instance just for comparison
+   --> src/main.rs:573:54
+    |
+573 |             Command::Agent { frame, .. } if frame == PathBuf::from("recording.mp4")
+    |                                                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: try: `*"recording.mp4"`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#cmp_owned
+    = note: `-D clippy::cmp-owned` implied by `-D warnings`
+    = help: to override `-D warnings` add `#[allow(clippy::cmp_owned)]`
+
+error: could not compile `computeruse` (bin "computeruse" test) due to 1 previous error
+warning: build failed, waiting for other jobs to finish...
+[0m
+[0m$ [0mcargo run --quiet --bin computeruse -- agent --help
+Run the instruction-driven visual policy over each frame of a video
+
+Usage: computeruse agent [OPTIONS] --frame <FRAME> --instructions <INSTRUCTIONS>
+
+Options:
+      --frame <FRAME>                Video file to process, such as an MP4 file
+      --frame-output <FRAME_OUTPUT>  Keep extracted PNG frames in this directory instead of a temporary directory
+      --instructions <INSTRUCTIONS>  
+      --model <MODEL>                [default: gpt-Astra]
+      --trajectory <TRAJECTORY>      [default: 3]
+      --max-steps <MAX_STEPS>        [default: 50]
+      --execute                      Actually inject policy actions. Without this flag the agent is a dry run
+      --trace <TRACE>                Optional JSONL transition log for evaluation or offline learning
+  -h, --help                         Print help
+[0m
+[0m$ [0mcargo run --quiet --bin video-frames -- --help
+Splice a video into ordered PNG frames
+
+Usage: video-frames --frame <FRAME> --output <OUTPUT>
+
+Options:
+      --frame <FRAME>    Video file to decode, such as an MP4 file
+  -o, --output <OUTPUT>  Directory in which to write frame-0000000000.png and later frames
+  -h, --help             Print help
+  -V, --version          Print version
+[0m
+[0m% [0mPatch 1 file
+[0m
+[0m$ [0mgit diff --check && git status --short && git diff --stat
+M QUICKSTART.md
+ M README.md
+ M src/agent.rs
+ M src/lib.rs
+ M src/main.rs
+?? frame_spec
+?? frame_spec.out
+?? src/bin/
+?? src/video.rs
+ QUICKSTART.md |  9 +++---
+ README.md     | 38 ++++++++++++++----------
+ src/agent.rs  | 82 +++++++++++++++++++++++++++++++++++++++++++++++++++
+ src/lib.rs    |  6 +++-
+ src/main.rs   | 94 ++++++++++++++++++++++++++++++++++++++++++++++++-----------
+ 5 files changed, 190 insertions(+), 39 deletions(-)
+[0m
+[0m✱ [0mGrep "--frames|frame_timeout|screencast frame|screencast-frames"[90m in . · 1 match[0m
+[0m
+[0m$ [0mcargo fmt --check && cargo test && cargo clippy --all-targets -- -D warnings
+Compiling computeruse v0.1.0 (/home/opencode/computeruse)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.52s
+     Running unittests src/lib.rs (target/debug/deps/computeruse-0b4a1abf3c1aab6f)
+
+running 20 tests
+test agent::tests::accepts_fenced_policy_json ... ok
+test agent::tests::action_protocol_round_trips ... ok
+test agent::tests::recognizes_supported_frame_types ... ok
+test agent::tests::frame_sequence_processes_every_frame_in_filename_order ... ok
+test controller::tests::click_and_double_click_preserve_order ... ok
+test controller::tests::home_moves_to_absolute_origin ... ok
+test controller::tests::playback_filter_excludes_requested_event_types ... ok
+test event::tests::button_aliases_parse ... ok
+test event::tests::events_round_trip_as_tagged_json ... ok
+test keyboard::tests::hotkey_presses_in_order_and_releases_in_reverse ... ok
+test keyboard::tests::hotkey_releases_pressed_modifiers_after_backend_failure ... ok
+test keyboard::tests::key_events_round_trip ... ok
+test keyboard::tests::playback_emits_repeat_events ... ok
+test agent::tests::rejects_incomplete_image_containers ... ok
+test linux::tests::converts_linux_button_events ... ok
+test linux::tests::converts_linux_keyboard_events_and_repeats ... ok
+test linux::tests::ignores_unknown_linux_events ... ok
+test video::tests::extracted_paths_only_include_numbered_png_frames ... ok
+test agent::tests::frame_source_starts_with_latest_bounded_trajectory ... ok
+test controller::tests::animated_motion_reaches_exact_destination ... ok
+
+test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running unittests src/main.rs (target/debug/deps/computeruse-47ad954a76633900)
+
+running 2 tests
+test tests::agent_actions_are_validated_before_execution ... ok
+test tests::agent_accepts_a_video_with_the_frame_flag ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/video-frames.rs (target/debug/deps/video_frames-51a6ca56835c6287)
+   Doc-tests computeruse
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+    Checking computeruse v0.1.0 (/home/opencode/computeruse)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.40s
+[0m
+[0m→ [0mRead README.md[90m [offset=136, limit=50][0m
+[0m→ [0mRead src/video.rs
+[0m→ [0mRead src/main.rs[90m [offset=90, limit=80][0m
+[0m→ [0mRead src/main.rs[90m [offset=280, limit=115][0m
+[0m% [0mPatch 3 files
+[0m% [0mPatch 1 file
+[0m
+[0m$ [0mgit diff --check && git status --short
+M QUICKSTART.md
+ M README.md
+ M src/agent.rs
+ M src/lib.rs
+ M src/main.rs
+?? frame_spec
+?? frame_spec.out
+?? src/bin/
+?? src/video.rs
+[0m
+[0m$ [0mls "/tmp/opencode"
+az-login.log
+chia-repository-key.asc
+chia.gpg
+chia.list
+mouse-upstream
+nft-cli-test
+spec-build-background-test.out
+spec-save-test.0q571E
+spec-save-test.6R4mZU
+specific test $x.B6O9fW
+specific test $x.bgSAXE
+specific-smoke-final.nWhByv
+specific-smoke.9eob2I
+specific-test.gLfXmz
+[0m
+[0m✱ [0mGrep "--frames|frame_timeout|screencast frame|screencast-frames"[90m in . · 0 matches[0m
+[0m
+[0m$ [0mcargo fmt --check && cargo test && cargo clippy --all-targets -- -D warnings
+Diff in /home/opencode/computeruse/src/video.rs:69:
+                         .and_then(|name| name.strip_suffix(FRAME_SUFFIX));
+                     digits.is_some_and(|digits| {
+                         digits.len() == 10
+[31m-                            && digits
+(B[m[31m-                                .chars()
+(B[m[31m-                                .all(|character| character.is_ascii_digit())
+(B[m[32m+                            && digits.chars().all(|character| character.is_ascii_digit())
+(B[m                     })
+                 })
+         })
+[0m
+[0m$ [0mcargo fmt
+(no output)
+[0m
+[0m$ [0mgit diff --check && git diff --stat
+QUICKSTART.md | 11 ++++---
+ README.md     | 38 ++++++++++++++----------
+ src/agent.rs  | 83 ++++++++++++++++++++++++++++++++++++++++++++++++++++
+ src/lib.rs    |  6 +++-
+ src/main.rs   | 94 ++++++++++++++++++++++++++++++++++++++++++++++++-----------
+ 5 files changed, 192 insertions(+), 40 deletions(-)
+[0m
+[0m$ [0mcargo fmt --check && cargo test && cargo clippy --all-targets -- -D warnings
+Compiling computeruse v0.1.0 (/home/opencode/computeruse)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.39s
+     Running unittests src/lib.rs (target/debug/deps/computeruse-0b4a1abf3c1aab6f)
+
+running 20 tests
+test agent::tests::accepts_fenced_policy_json ... ok
+test agent::tests::recognizes_supported_frame_types ... ok
+test agent::tests::action_protocol_round_trips ... ok
+test agent::tests::frame_sequence_processes_every_frame_in_filename_order ... ok
+test agent::tests::rejects_incomplete_image_containers ... ok
+test controller::tests::home_moves_to_absolute_origin ... ok
+test controller::tests::click_and_double_click_preserve_order ... ok
+test controller::tests::playback_filter_excludes_requested_event_types ... ok
+test event::tests::button_aliases_parse ... ok
+test event::tests::events_round_trip_as_tagged_json ... ok
+test keyboard::tests::hotkey_releases_pressed_modifiers_after_backend_failure ... ok
+test keyboard::tests::key_events_round_trip ... ok
+test keyboard::tests::playback_emits_repeat_events ... ok
+test linux::tests::converts_linux_button_events ... ok
+test linux::tests::converts_linux_keyboard_events_and_repeats ... ok
+test linux::tests::ignores_unknown_linux_events ... ok
+test video::tests::extracted_paths_only_include_numbered_png_frames ... ok
+test keyboard::tests::hotkey_presses_in_order_and_releases_in_reverse ... ok
+test agent::tests::frame_source_starts_with_latest_bounded_trajectory ... ok
+test controller::tests::animated_motion_reaches_exact_destination ... ok
+
+test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+
+running 2 tests
+     Running unittests src/main.rs (target/debug/deps/computeruse-47ad954a76633900)
+     Running unittests src/bin/video-frames.rs (target/debug/deps/video_frames-51a6ca56835c6287)
+test tests::agent_actions_are_validated_before_execution ... ok
+test tests::agent_accepts_a_video_with_the_frame_flag ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests computeruse
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+    Checking computeruse v0.1.0 (/home/opencode/computeruse)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.62s
+[0m
+[0m$ [0mcargo run --quiet --bin video-frames -- --frame frame_spec --output "/tmp/opencode/computeruse-video-error-20260908"
+Error: cannot run ffmpeg; install FFmpeg and ensure `ffmpeg` is on PATH
+
+Caused by:
+    No such file or directory (os error 2)
+[0m
+[0m$ [0mrmdir "/tmp/opencode/computeruse-video-error-20260908"
+(no output)
+[0m
+[0m# [0mTodos
+[✓] Inspect the existing CLI, input handling, and build setup
+[✓] Implement the Rust video frame-splicing tool and connect the --frame pipeline
+[✓] Add or update tests and documentation, then verify the workflow
+[0m
+Implemented video-based frame processing.
+
+**Changes**
+- Refactored the agent CLI from `--frames <directory>` to `--frame <video>`.
+- Added optional `--frame-output <directory>` to preserve extracted PNGs.
+- Added the standalone `video-frames` Rust binary:
+  ```bash
+  video-frames --frame ./recording.mp4 --output ./video-frames
+  ```
+- Added reusable `extract_video_frames` library API.
+- Frames are written as ordered files:
+  ```text
+  frame-0000000000.png
+  frame-0000000001.png
+  ```
+- Added `FrameSequence` for sequential, frame-by-frame policy processing.
+- Temporary frames are automatically removed unless `--frame-output` is supplied.
+- Added tests and updated `README.md` and `QUICKSTART.md`.
+
+**Agent Usage**
+```bash
+computeruse agent \
+  --frame ./recording.mp4 \
+  --instructions ./gui-steps.txt \
+  --trace ./trajectory.jsonl
+```
+
+FFmpeg must be installed and available on `PATH`. Missing FFmpeg now produces an actionable error.
+
+**Verification**
+- `cargo fmt --check` passed.
+- `cargo test` passed, 22 tests.
+- `cargo clippy --all-targets -- -D warnings` passed.
+- Both CLI help interfaces were validated.
