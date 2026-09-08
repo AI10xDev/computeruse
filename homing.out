@@ -3,238 +3,154 @@ Using spec: /home/opencode/computeruse/homing
 [0m
 > build · gpt-5.6-sol
 [0m
-I’ll trace the `play` CLI path and the computer-use pointer controls, then add the smallest pre-play homing step and verify it with the existing tests.
+I’ll trace the CLI handling for `--record` and `play`, then add mouse homing at the point those modes begin so it happens after argument parsing and before input capture or playback.
 [0m# [0mTodos
-[•] Locate the `play` CLI execution path and pointer movement API
-[ ] Home the pointer to (0, 0) immediately before `play` executes
-[ ] Run targeted tests and inspect the resulting diff
+[•] Locate CLI record and play execution paths
+[ ] Implement mouse homing after mode selection
+[ ] Run focused tests or verification
 [0m
 [0m✱ [0mGlob "**/*"[90m in . · 100 matches[0m
-[0m✱ [0mGrep "\bplay\b"[90m in . · 3 matches[0m
-[0m✱ [0mGrep "move(To)?|mouse|cursor|pointer|position"[90m in . · 48 matches[0m
-[0m→ [0mRead Cargo.toml
-[0m→ [0mRead README.md
-[0m→ [0mRead src/main.rs
-[0m→ [0mRead src/controller.rs
+[0m✱ [0mGrep "--record|\bplay\b|record"[90m in . · 22 matches[0m
+[0m→ [0mRead README.md[90m [offset=1, limit=240][0m
+[0m→ [0mRead Cargo.toml[90m [offset=1, limit=180][0m
+[0m→ [0mRead homing[90m [offset=1, limit=120][0m
+[0m→ [0mRead src/main.rs[90m [offset=1, limit=330][0m
+[0m→ [0mRead src/main.rs[90m [offset=450, limit=180][0m
+[0m→ [0mRead src/controller.rs[90m [offset=1, limit=290][0m
+[0m✱ [0mGrep "fn home|home\("[90m in src · 5 matches[0m
 [0m
-[0m$ [0mgit status --short && git diff -- src/main.rs src/controller.rs
-M README.md
- M src/controller.rs
- M src/main.rs
-?? homing
-?? homing.out
-diff --git a/src/controller.rs b/src/controller.rs
-index a81200b..60e6850 100644
---- a/src/controller.rs
-+++ b/src/controller.rs
-@@ -47,6 +47,11 @@ impl<B: MouseBackend> Controller<B> {
-         self.backend.move_absolute(x, y)
-     }
- 
-+    /// Moves to the normalized desktop origin at the upper-left corner.
-+    pub fn home(&mut self) -> Result<(), B::Error> {
-+        self.move_absolute(0, 0)
-+    }
-+
-     pub fn wheel(&mut self, delta: i32) -> Result<(), B::Error> {
-         self.backend.wheel(delta, false)
-     }
-@@ -200,6 +205,13 @@ mod tests {
-         assert_eq!(totals, (7, -5));
-     }
- 
-+    #[test]
-+    fn home_moves_to_absolute_origin() {
-+        let mut controller = Controller::new(FakeBackend::default());
-+        controller.home().unwrap();
-+        assert_eq!(controller.backend.0, ["absolute:0,0"]);
-+    }
-+
-     #[test]
-     fn playback_filter_excludes_requested_event_types() {
-         let events = [
-diff --git a/src/main.rs b/src/main.rs
-index 3bf9660..6e625db 100644
---- a/src/main.rs
-+++ b/src/main.rs
-@@ -135,7 +135,16 @@ fn control(command: Command) -> Result<()> {
- }
- 
- fn record(output: PathBuf, stop_button: Button) -> Result<()> {
-+    // Open physical devices before creating uinput devices so recording cannot
-+    // include events from the virtual mouse used for homing.
-     let mut listener = Listener::new()?;
-+    let mut mouse = Controller::new(
-+        LinuxMouse::new().context("cannot create uinput device; check /dev/uinput permissions")?,
-+    );
-+    mouse
-+        .home()
-+        .context("cannot move mouse to the home position before recording")?;
-+
-     let mut events = Vec::new();
-     listener.listen_until(|event| {
-         let stopped = matches!(
+[0m$ [0mgit diff -- src/main.rs README.md
+(no output)
 [0m
-[0m→ [0mRead docs/MIGRATION.md
-The existing worktree already adds `Controller::home()` and uses it before recording. I’ll reuse that API in the `Play` branch after the recording is validated and loaded, immediately before event playback, so invalid inputs do not move the pointer. I’ll also align the CLI documentation with the new behavior.
+[0m$ [0mgit status --short
+M homing
+ M homing.out
 [0m
-[0m# [0mTodos
-[✓] Locate the `play` CLI execution path and pointer movement API
-[•] Home the pointer to (0, 0) immediately before `play` executes
-[ ] Run targeted tests and inspect the resulting diff
+[0m→ [0mRead homing.out[90m [offset=1, limit=200][0m
+The requested behavior is already present in the tracked source: mouse `record` homes before capture, and mouse `play` homes after loading/validating the recording but before replay. I’m checking the implementation’s test coverage and CLI naming to determine whether the remaining gap is verification or support for a literal `--record` flag.
 [0m
-[0m% [0mPatch 2 files
+[0m$ [0mgit log --oneline -10
+1ac280a Implement targeted recording/replay fixes
+9a8dccd Reproduce and fix the empty recording list issue
+ac53ea5 Stop mouse recording with Escape
+12dcd54 Add video frame processing from file
+0d45a75 update end-to-end functionality
+6d55eb5 Add gpt-Astra visual agent support
+da149c0 Update CI checkout action
+c26a81f Initial Rust mouse automation implementation
+[0m
+[0m✱ [0mGlob "tests/**/*.rs"[90m in . · 0 matches[0m
+[0m
+[0m$ [0mgit blame -L 184,203 src/main.rs && git blame -L 488,500 src/main.rs
+^c26a81f (Ubuntu 2026-09-08 02:52:36 +0000 184)         Command::Play {
+^c26a81f (Ubuntu 2026-09-08 02:52:36 +0000 185)             input,
+^c26a81f (Ubuntu 2026-09-08 02:52:36 +0000 186)             speed,
+^c26a81f (Ubuntu 2026-09-08 02:52:36 +0000 187)             no_buttons,
+^c26a81f (Ubuntu 2026-09-08 02:52:36 +0000 188)             no_movement,
+^c26a81f (Ubuntu 2026-09-08 02:52:36 +0000 189)             no_wheel,
+^c26a81f (Ubuntu 2026-09-08 02:52:36 +0000 190)         } => {
+^c26a81f (Ubuntu 2026-09-08 02:52:36 +0000 191)             if speed < 0.0 {
+^c26a81f (Ubuntu 2026-09-08 02:52:36 +0000 192)                 bail!("speed must be zero or greater");
+^c26a81f (Ubuntu 2026-09-08 02:52:36 +0000 193)             }
+^c26a81f (Ubuntu 2026-09-08 02:52:36 +0000 194)             let reader = BufReader::new(
+^c26a81f (Ubuntu 2026-09-08 02:52:36 +0000 195)                 File::open(&input)
+^c26a81f (Ubuntu 2026-09-08 02:52:36 +0000 196)                     .with_context(|| format!("cannot open recording at {}", input.display()))?,
+^c26a81f (Ubuntu 2026-09-08 02:52:36 +0000 197)             );
+^c26a81f (Ubuntu 2026-09-08 02:52:36 +0000 198)             let events: Vec<MouseEvent> = serde_json::from_reader(reader)?;
+6d55eb53 (Ubuntu 2026-09-08 07:22:03 +0000 199)             mouse
+6d55eb53 (Ubuntu 2026-09-08 07:22:03 +0000 200)                 .home()
+6d55eb53 (Ubuntu 2026-09-08 07:22:03 +0000 201)                 .context("cannot move mouse to the home position before playback")?;
+^c26a81f (Ubuntu 2026-09-08 02:52:36 +0000 202)             mouse.play(
+^c26a81f (Ubuntu 2026-09-08 02:52:36 +0000 203)                 &events,
+ac53ea5a (Ubuntu 2026-09-08 16:40:05 +0000 488) fn record(output: PathBuf) -> Result<()> {
+6d55eb53 (Ubuntu 2026-09-08 07:22:03 +0000 489)     // Open physical devices before creating uinput devices so recording cannot
+6d55eb53 (Ubuntu 2026-09-08 07:22:03 +0000 490)     // include events from the virtual mouse used for homing.
+^c26a81f (Ubuntu 2026-09-08 02:52:36 +0000 491)     let mut listener = Listener::new()?;
+ac53ea5a (Ubuntu 2026-09-08 16:40:05 +0000 492)     let mut keyboard = KeyboardListener::new()?;
+6d55eb53 (Ubuntu 2026-09-08 07:22:03 +0000 493)     let mut mouse = Controller::new(
+6d55eb53 (Ubuntu 2026-09-08 07:22:03 +0000 494)         LinuxMouse::new().context("cannot create uinput device; check /dev/uinput permissions")?,
+6d55eb53 (Ubuntu 2026-09-08 07:22:03 +0000 495)     );
+6d55eb53 (Ubuntu 2026-09-08 07:22:03 +0000 496)     mouse
+6d55eb53 (Ubuntu 2026-09-08 07:22:03 +0000 497)         .home()
+6d55eb53 (Ubuntu 2026-09-08 07:22:03 +0000 498)         .context("cannot move mouse to the home position before recording")?;
+6d55eb53 (Ubuntu 2026-09-08 07:22:03 +0000 499) 
+^c26a81f (Ubuntu 2026-09-08 02:52:36 +0000 500)     let mut events = Vec::new();
+[0m
+[0m✱ [0mGlob "src/**/*.rs"[90m in . · 9 matches[0m
 [0m
 [0m# [0mTodos
-[✓] Locate the `play` CLI execution path and pointer movement API
-[✓] Home the pointer to (0, 0) immediately before `play` executes
-[•] Run targeted tests and inspect the resulting diff
+[✓] Locate CLI record and play execution paths
+[✓] Confirm existing mouse homing implementation satisfies requested behavior
+[•] Run focused tests or verification
 [0m
-The playback branch now homes only after speed validation, file opening, and JSON decoding succeed, then propagates a specific homing error before any recorded event can run. I’m checking formatting, unit behavior, and lint cleanliness against the combined worktree changes.
 [0m$ [0mcargo fmt --check
 (no output)
 [0m
 [0m$ [0mcargo test --all-targets --all-features
-Compiling computeruse v0.1.0 (/home/opencode/computeruse)
-    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.22s
-     Running unittests src/lib.rs (target/debug/deps/computeruse-53b587dd7d330347)
+Finished `test` profile [unoptimized + debuginfo] target(s) in 0.13s
+     Running unittests src/lib.rs (target/debug/deps/computeruse-0b4a1abf3c1aab6f)
 
-running 8 tests
+running 22 tests
+test agent::tests::accepts_fenced_policy_json ... ok
+test agent::tests::action_protocol_round_trips ... ok
+test agent::tests::frame_sequence_processes_every_frame_in_filename_order ... ok
+test agent::tests::recognizes_supported_frame_types ... ok
 test controller::tests::click_and_double_click_preserve_order ... ok
+test agent::tests::rejects_incomplete_image_containers ... ok
 test controller::tests::home_moves_to_absolute_origin ... ok
 test controller::tests::playback_filter_excludes_requested_event_types ... ok
 test event::tests::button_aliases_parse ... ok
-test linux::tests::converts_linux_button_events ... ok
-test linux::tests::ignores_unknown_linux_events ... ok
 test event::tests::events_round_trip_as_tagged_json ... ok
+test keyboard::tests::hotkey_releases_pressed_modifiers_after_backend_failure ... ok
+test keyboard::tests::key_events_round_trip ... ok
+test keyboard::tests::playback_emits_repeat_events ... ok
+test linux::tests::combines_pointer_axes_in_one_replay_event ... ok
+test keyboard::tests::hotkey_presses_in_order_and_releases_in_reverse ... ok
+test linux::tests::converts_linux_button_events ... ok
+test linux::tests::converts_linux_keyboard_events_and_repeats ... ok
+test linux::tests::ignores_unknown_linux_events ... ok
+test linux::tests::touch_release_resets_absolute_pointer_position ... ok
+test video::tests::extracted_paths_only_include_numbered_png_frames ... ok
+test agent::tests::frame_source_starts_with_latest_bounded_trajectory ... ok
 test controller::tests::animated_motion_reaches_exact_destination ... ok
 
-test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+test result: ok. 22 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running unittests src/main.rs (target/debug/deps/computeruse-47ad954a76633900)
+
+running 4 tests
+test tests::agent_actions_are_validated_before_execution ... ok
+test tests::escape_press_stops_mouse_recording ... ok
+test tests::agent_accepts_a_video_with_the_frame_flag ... ok
+test tests::record_only_requires_an_output_path ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
 
 
 running 0 tests
 
 test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
 
-     Running unittests src/main.rs (target/debug/deps/computeruse-f44470a99cd3a144)
-[0m
-[0m$ [0mgit diff --check && git diff -- README.md src/main.rs src/controller.rs && git status --short
-diff --git a/README.md b/README.md
-index 7ecfe0a..74313e6 100644
---- a/README.md
-+++ b/README.md
-@@ -73,7 +73,8 @@ computeruse move-to 32768 32768
- # Print newline-delimited JSON events until interrupted.
- computeruse listen
- 
--# Record through the first right-button press, then replay twice as fast.
-+# Home the pointer to (0, 0), record through the first right-button press,
-+# then home it again and replay twice as fast.
- computeruse record session.json
- computeruse play session.json --speed 2
- 
-@@ -81,9 +82,12 @@ computeruse play session.json --speed 2
- computeruse play session.json --no-buttons
- ```
- 
--The `record` command includes the stop event in the file, matching the behavior
--of the original Python package. Use `--stop-button middle` to select another
--button. A speed of `0` replays events without delays.
-+Before capture starts, the `record` command moves the pointer to normalized
-+desktop coordinate `(0, 0)`, making that position the origin for the recorded
-+relative movement. The `play` command returns the pointer to the same origin
-+before replaying events. Recordings include the stop event in the file,
-+matching the behavior of the original Python package. Use `--stop-button
-+middle` to select another button. A speed of `0` replays events without delays.
- 
- ## Library
- 
-diff --git a/src/controller.rs b/src/controller.rs
-index a81200b..60e6850 100644
---- a/src/controller.rs
-+++ b/src/controller.rs
-@@ -47,6 +47,11 @@ impl<B: MouseBackend> Controller<B> {
-         self.backend.move_absolute(x, y)
-     }
- 
-+    /// Moves to the normalized desktop origin at the upper-left corner.
-+    pub fn home(&mut self) -> Result<(), B::Error> {
-+        self.move_absolute(0, 0)
-+    }
-+
-     pub fn wheel(&mut self, delta: i32) -> Result<(), B::Error> {
-         self.backend.wheel(delta, false)
-     }
-@@ -200,6 +205,13 @@ mod tests {
-         assert_eq!(totals, (7, -5));
-     }
- 
-+    #[test]
-+    fn home_moves_to_absolute_origin() {
-+        let mut controller = Controller::new(FakeBackend::default());
-+        controller.home().unwrap();
-+        assert_eq!(controller.backend.0, ["absolute:0,0"]);
-+    }
-+
-     #[test]
-     fn playback_filter_excludes_requested_event_types() {
-         let events = [
-diff --git a/src/main.rs b/src/main.rs
-index 3bf9660..31175ef 100644
---- a/src/main.rs
-+++ b/src/main.rs
-@@ -119,6 +119,9 @@ fn control(command: Command) -> Result<()> {
-                     .with_context(|| format!("cannot open recording at {}", input.display()))?,
-             );
-             let events: Vec<MouseEvent> = serde_json::from_reader(reader)?;
-+            mouse
-+                .home()
-+                .context("cannot move mouse to the home position before playback")?;
-             mouse.play(
-                 &events,
-                 speed,
-@@ -135,7 +138,16 @@ fn control(command: Command) -> Result<()> {
- }
- 
- fn record(output: PathBuf, stop_button: Button) -> Result<()> {
-+    // Open physical devices before creating uinput devices so recording cannot
-+    // include events from the virtual mouse used for homing.
-     let mut listener = Listener::new()?;
-+    let mut mouse = Controller::new(
-+        LinuxMouse::new().context("cannot create uinput device; check /dev/uinput permissions")?,
-+    );
-+    mouse
-+        .home()
-+        .context("cannot move mouse to the home position before recording")?;
-+
-     let mut events = Vec::new();
-     listener.listen_until(|event| {
-         let stopped = matches!(
- M README.md
- M src/controller.rs
- M src/main.rs
-?? homing
-?? homing.out
+     Running unittests src/bin/video-frames.rs (target/debug/deps/video_frames-51a6ca56835c6287)
 [0m
 [0m$ [0mcargo clippy --all-targets --all-features -- -D warnings
-Checking computeruse v0.1.0 (/home/opencode/computeruse)
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.17s
+Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.12s
 [0m
 [0m# [0mTodos
-[✓] Locate the `play` CLI execution path and pointer movement API
-[✓] Home the pointer to (0, 0) immediately before `play` executes
-[✓] Run targeted tests and inspect the resulting diff
+[✓] Locate CLI record and play execution paths
+[✓] Confirm existing mouse homing implementation satisfies requested behavior
+[✓] Run focused tests or verification
 [0m
-Updated `computeruse play` to home the pointer to normalized `(0, 0)` immediately before playback begins.
+Mouse homing is already implemented:
 
-- Added `mouse.home()` in the `Play` branch after input validation and JSON decoding.
-- Added contextual error reporting if homing fails.
-- Updated `README.md` to document record/play homing behavior.
-- Left unrelated untracked files unchanged.
+- `computeruse record <output>` calls `mouse.home()` before recording at `src/main.rs:496`.
+- `computeruse play <input>` calls `mouse.home()` before playback at `src/main.rs:199`.
+- `Controller::home()` moves to normalized `(0, 0)` at `src/controller.rs:51`.
 
 Verification passed:
 
+- `cargo test --all-targets --all-features`: 26 tests passed
 - `cargo fmt --check`
-- `cargo test --all-targets --all-features` with 8 tests passing
 - `cargo clippy --all-targets --all-features -- -D warnings`
-- `git diff --check`
+
+No source changes were necessary.

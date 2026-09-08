@@ -1,3 +1,1 @@
-#use the bopreh/keyboard to hook and play keyboard events (refactor to rust beforehand)
-#once completed read video frames from screencast for processing in specified directory
-#use the frames (state trajactory estimation) as input to a reinforcement learning framework (using gpt-sol) to action the key events (mouse, keyboard) -- given a file of instruction on gui & ui/ux steps   
+#home the mouse after the cli flag --record and play is passed 
