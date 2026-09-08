@@ -1,12 +1,12 @@
 # Quickstart
 
 `computeruse` captures and controls the mouse and keyboard on Linux. Its visual
-agent sends screencast frames and GUI instructions to gpt-Astra, then prints the
+agent sends video frames and GUI instructions to gpt-Astra, then prints the
 model's proposed actions. Input is only injected when you add `--execute`.
 
 ## 1. Build
 
-Install Rust 1.88 or newer, clone the repository, and run:
+Install Rust 1.88 or newer and FFmpeg, clone the repository, and run:
 
 ```bash
 cargo build --release
@@ -30,11 +30,10 @@ group setup in the [README](README.md#requirements).
 
 ## 4. Run The gpt-Astra Agent
 
-Create a directory that your screencast tool will fill with PNG, JPEG, or WebP
-frames, and write one or more GUI instructions:
+Record an MP4 (or another format supported by FFmpeg) and write one or more GUI
+instructions:
 
 ```bash
-mkdir -p screencast-frames
 printf '%s\n' 'Open the browser settings page.' > gui-steps.txt
 export OPENAI_API_KEY=...
 export OPENAI_BASE_URL=https://api.openai.com/v1
@@ -44,7 +43,7 @@ Start with dry-run mode. It prints JSON decisions but does not control input:
 
 ```bash
 ./target/release/computeruse agent \
-  --frames ./screencast-frames \
+  --frame ./recording.mp4 \
   --instructions ./gui-steps.txt \
   --trace ./trajectory.jsonl
 ```

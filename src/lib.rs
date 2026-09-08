@@ -7,16 +7,20 @@ mod agent;
 mod controller;
 mod event;
 mod keyboard;
+mod video;
 
 #[cfg(target_os = "linux")]
 mod linux;
 
-pub use agent::{Action, AgentDecision, Frame, FrameSource, GptAstraPolicy, Policy, Transition};
+pub use agent::{
+    Action, AgentDecision, Frame, FrameSequence, FrameSource, GptAstraPolicy, Policy, Transition,
+};
 pub use controller::{Controller, MouseBackend, PlaybackFilter};
 pub use event::{Button, ButtonState, MouseEvent};
 pub use keyboard::{
     Key, KeyState, KeyboardBackend, KeyboardController, KeyboardEvent, KeyboardPlaybackFilter,
 };
+pub use video::extract_video_frames;
 
 #[cfg(target_os = "linux")]
 pub use linux::{KeyboardListener, LinuxKeyboard, LinuxMouse, Listener};

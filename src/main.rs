@@ -1,16 +1,16 @@
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use computeruse::{
-    Action, Button, Controller, FrameSource, GptAstraPolicy, Key, KeyState, KeyboardController,
+    Action, Button, Controller, FrameSequence, GptAstraPolicy, Key, KeyState, KeyboardController,
     KeyboardEvent, KeyboardListener, KeyboardPlaybackFilter, LinuxKeyboard, LinuxMouse, Listener,
-    MouseEvent, PlaybackFilter, Policy, Transition,
+    MouseEvent, PlaybackFilter, Policy, Transition, extract_video_frames,
 };
 use serde::Serialize;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, BufWriter, Write};
 use std::path::PathBuf;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[derive(Parser)]
 #[command(version, about)]
@@ -94,10 +94,14 @@ enum Command {
         #[arg(long)]
         no_release: bool,
     },
-    /// Run the instruction-driven visual policy over screencast frames.
+    /// Run the instruction-driven visual policy over each frame of a video.
     Agent {
+        /// Video file to process, such as an MP4 file.
         #[arg(long)]
-        frames: PathBuf,
+        frame: PathBuf,
+        /// Keep extracted PNG frames in this directory instead of a temporary directory.
+        #[arg(long)]
+        frame_output: Option<PathBuf>,
         #[arg(long)]
         instructions: PathBuf,
         #[arg(long, default_value = "gpt-Astra")]
@@ -106,8 +110,6 @@ enum Command {
         trajectory: usize,
         #[arg(long, default_value_t = 50)]
         max_steps: usize,
-        #[arg(long, default_value_t = 10_000)]
-        frame_timeout_ms: u64,
         /// Actually inject policy actions. Without this flag the agent is a dry run.
         #[arg(long)]
         execute: bool,
@@ -133,21 +135,21 @@ fn main() -> Result<()> {
         }
         Command::KeyboardRecord { output, stop_key } => keyboard_record(output, stop_key),
         Command::Agent {
-            frames,
+            frame,
+            frame_output,
             instructions,
             model,
             trajectory,
             max_steps,
-            frame_timeout_ms,
             execute,
             trace,
         } => run_agent(AgentOptions {
-            frames,
+            frame,
+            frame_output,
             instructions,
             model,
             trajectory,
             max_steps,
-            frame_timeout: Duration::from_millis(frame_timeout_ms),
             execute,
             trace,
         }),
@@ -285,14 +287,40 @@ fn keyboard_record(output: PathBuf, stop_key: Key) -> Result<()> {
 }
 
 struct AgentOptions {
-    frames: PathBuf,
+    frame: PathBuf,
+    frame_output: Option<PathBuf>,
     instructions: PathBuf,
     model: String,
     trajectory: usize,
     max_steps: usize,
-    frame_timeout: Duration,
     execute: bool,
     trace: Option<PathBuf>,
+}
+
+struct TemporaryFrameDirectory {
+    path: PathBuf,
+}
+
+impl TemporaryFrameDirectory {
+    fn new() -> Result<Self> {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .context("system clock is before the Unix epoch")?
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "computeruse-video-frames-{}-{suffix}",
+            std::process::id()
+        ));
+        fs::create_dir(&path)
+            .with_context(|| format!("cannot create temporary directory {}", path.display()))?;
+        Ok(Self { path })
+    }
+}
+
+impl Drop for TemporaryFrameDirectory {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
 }
 
 fn run_agent(options: AgentOptions) -> Result<()> {
@@ -302,7 +330,22 @@ fn run_agent(options: AgentOptions) -> Result<()> {
             options.instructions.display()
         )
     })?;
-    let mut frames = FrameSource::new(options.frames, options.trajectory)?;
+    let temporary_frames = options
+        .frame_output
+        .is_none()
+        .then(TemporaryFrameDirectory::new)
+        .transpose()?;
+    let frame_output = options
+        .frame_output
+        .as_deref()
+        .or_else(|| {
+            temporary_frames
+                .as_ref()
+                .map(|directory| directory.path.as_path())
+        })
+        .expect("a persistent or temporary frame output exists");
+    let paths = extract_video_frames(&options.frame, frame_output)?;
+    let mut frames = FrameSequence::new(paths, options.trajectory)?;
     let policy = GptAstraPolicy::from_env(options.model)?;
     let mut transitions = Vec::new();
     let mut previous_progress = 0.0;
@@ -322,9 +365,9 @@ fn run_agent(options: AgentOptions) -> Result<()> {
     };
 
     for step in 0..options.max_steps {
-        let trajectory = frames
-            .next(options.frame_timeout)?
-            .with_context(|| format!("timed out waiting for a new frame at step {step}"))?;
+        let trajectory = frames.advance()?.with_context(|| {
+            format!("video ended before the agent completed the instructions at step {step}")
+        })?;
         let frame = trajectory
             .back()
             .expect("trajectory has a new frame")
@@ -512,5 +555,22 @@ mod tests {
             ])
             .is_ok()
         );
+    }
+
+    #[test]
+    fn agent_accepts_a_video_with_the_frame_flag() {
+        let cli = Cli::try_parse_from([
+            "computeruse",
+            "agent",
+            "--frame",
+            "recording.mp4",
+            "--instructions",
+            "steps.txt",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Agent { frame, .. } if frame == *"recording.mp4"
+        ));
     }
 }

@@ -36,6 +36,13 @@ pub struct FrameSource {
     trajectory_len: usize,
 }
 
+/// An ordered, finite source used for frame-by-frame processing of a video.
+pub struct FrameSequence {
+    paths: VecDeque<PathBuf>,
+    trajectory: VecDeque<Frame>,
+    trajectory_len: usize,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct FrameIdentity {
     len: u64,
@@ -108,6 +115,43 @@ impl FrameSource {
             .collect::<Vec<_>>();
         paths.sort_by_cached_key(|(path, identity)| (identity.modified, path.clone()));
         Ok(paths)
+    }
+}
+
+impl FrameSequence {
+    pub fn new(paths: impl IntoIterator<Item = PathBuf>, trajectory_len: usize) -> Result<Self> {
+        if trajectory_len == 0 {
+            bail!("trajectory length must be greater than zero");
+        }
+        let mut paths = paths.into_iter().collect::<Vec<_>>();
+        paths.sort();
+        if paths.is_empty() {
+            bail!("video contains no frames");
+        }
+        Ok(Self {
+            paths: paths.into(),
+            trajectory: VecDeque::new(),
+            trajectory_len,
+        })
+    }
+
+    pub fn advance(&mut self) -> Result<Option<&VecDeque<Frame>>> {
+        let Some(path) = self.paths.pop_front() else {
+            return Ok(None);
+        };
+        let metadata = fs::metadata(&path)
+            .with_context(|| format!("cannot inspect frame {}", path.display()))?;
+        let identity = FrameIdentity {
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+        };
+        let frame = read_stable_frame(&path, identity)?
+            .with_context(|| format!("extracted frame is incomplete: {}", path.display()))?;
+        self.trajectory.push_back(frame);
+        while self.trajectory.len() > self.trajectory_len {
+            self.trajectory.pop_front();
+        }
+        Ok(Some(&self.trajectory))
     }
 }
 
@@ -386,6 +430,45 @@ mod tests {
         let trajectory = source.next(Duration::ZERO).unwrap().unwrap();
         assert_eq!(trajectory.back().unwrap().bytes, changed);
 
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn frame_sequence_processes_every_frame_in_filename_order() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!("computeruse-sequence-{suffix}"));
+        fs::create_dir(&directory).unwrap();
+        let paths = ["frame-0000000001.png", "frame-0000000000.png"].map(|name| {
+            let path = directory.join(name);
+            fs::write(&path, fake_png(name.as_bytes()[17])).unwrap();
+            path
+        });
+
+        let mut source = FrameSequence::new(paths, 1).unwrap();
+        assert!(
+            source
+                .advance()
+                .unwrap()
+                .unwrap()
+                .back()
+                .unwrap()
+                .path
+                .ends_with("frame-0000000000.png")
+        );
+        assert!(
+            source
+                .advance()
+                .unwrap()
+                .unwrap()
+                .back()
+                .unwrap()
+                .path
+                .ends_with("frame-0000000001.png")
+        );
+        assert!(source.advance().unwrap().is_none());
         fs::remove_dir_all(directory).unwrap();
     }
 

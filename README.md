@@ -16,7 +16,7 @@ for Ubuntu 26.04. No display-server-specific automation API is required.
 - Move to normalized absolute coordinates through a virtual absolute pointer.
 - Record events as portable JSON and replay them with timing and type filters.
 - Hook, record, replay, and inject keyboard keys and simultaneous hotkeys.
-- Read ordered screencast frames and retain a bounded visual state trajectory.
+- Splice videos into ordered PNG frames and retain a bounded visual trajectory.
 - Use an OpenAI-compatible gpt-Astra vision policy to propose or execute GUI actions.
 - Use the same functionality from the CLI or the Rust library.
 - Test high-level behavior without access to physical input hardware.
@@ -25,6 +25,7 @@ for Ubuntu 26.04. No display-server-specific automation API is required.
 
 - Linux with `evdev` and `uinput` enabled (standard in Ubuntu kernels).
 - Rust 1.88 or newer to build from source.
+- FFmpeg on `PATH` for video frame extraction and visual-agent processing.
 - Read access to mouse devices under `/dev/input` for capture.
 - Write access to `/dev/uinput` for control.
 
@@ -135,16 +136,19 @@ release them in reverse order, matching `boppreh/keyboard` behavior.
 
 ## Visual Agent
 
-The `agent` command watches a screencast frame directory and evaluates GUI
-instructions from a text file. PNG, JPEG, and WebP files are ordered by
-modification time. Each policy call receives the latest bounded frame
-trajectory and prior transitions, then emits typed mouse, keyboard, scroll, or
-wait actions. The transition log includes the policy's progress estimate and
-its change as a reward signal for evaluation or offline reinforcement learning.
-Frame producers should write to a temporary name and atomically rename the
-finished image into the watched directory. Rewritten paths are detected from
-their size and modification time, and reads that change while in progress are
-deferred.
+The `agent` command accepts a video through `--frame`, extracts every image with
+FFmpeg, and evaluates GUI instructions from a text file frame by frame. Each
+policy call receives the latest bounded trajectory and prior transitions, then
+emits typed mouse, keyboard, scroll, or wait actions. The transition log
+includes the policy's progress estimate and its change as a reward signal for
+evaluation or offline reinforcement learning.
+
+The package also installs a standalone Rust frame-splicing tool. Its output
+directory must not already contain files named `frame-*.png`:
+
+```bash
+video-frames --frame ./recording.mp4 --output ./video-frames
+```
 
 Set an API key and optionally an OpenAI-compatible endpoint:
 
@@ -154,21 +158,23 @@ export OPENAI_BASE_URL=https://api.openai.com/v1
 
 # Safe default: inspect decisions as JSONL without injecting input.
 computeruse agent \
-  --frames ./screencast-frames \
+  --frame ./recording.mp4 \
   --instructions ./gui-steps.txt \
   --trace ./trajectory.jsonl
 
 # Explicitly allow model-selected mouse and keyboard input.
 computeruse agent \
-  --frames ./screencast-frames \
+  --frame ./recording.mp4 \
+  --frame-output ./extracted-frames \
   --instructions ./gui-steps.txt \
   --execute
 ```
 
 The default model is `gpt-Astra`; override it with `--model` for the name
-exposed by your endpoint. On the first step the source uses only the newest
-trajectory window, so stale frames are not replayed. After an action it waits
-for a new frame. `--execute` is deliberately required for input injection.
+exposed by your endpoint. Unless `--frame-output` is supplied, extracted frames
+are kept in a temporary directory and removed when the command exits. The
+agent processes one video frame per step. `--execute` is deliberately required
+for input injection.
 Policy actions are atomic key taps/hotkeys and mouse clicks rather than
 persistent holds. Each decision is limited to 16 actions, relative movement to
 32767 units per axis, scrolling to 100 units, and waits to 30 seconds.
