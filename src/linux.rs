@@ -1,0 +1,260 @@
+use crate::{Button, ButtonState, MouseBackend, MouseEvent};
+use evdev::uinput::VirtualDevice;
+use evdev::{
+    AbsInfo, AbsoluteAxisCode, AttributeSet, Device, EventSummary, EventType, InputEvent, KeyCode,
+    RelativeAxisCode,
+};
+use std::io;
+use std::path::PathBuf;
+use std::thread;
+use std::time::Duration;
+
+const ABS_MAX: i32 = u16::MAX as i32;
+
+pub struct LinuxMouse {
+    relative: VirtualDevice,
+    absolute: VirtualDevice,
+}
+
+impl LinuxMouse {
+    pub fn new() -> io::Result<Self> {
+        let mut keys = AttributeSet::<KeyCode>::new();
+        for key in [
+            KeyCode::BTN_LEFT,
+            KeyCode::BTN_RIGHT,
+            KeyCode::BTN_MIDDLE,
+            KeyCode::BTN_SIDE,
+            KeyCode::BTN_EXTRA,
+        ] {
+            keys.insert(key);
+        }
+
+        let mut axes = AttributeSet::<RelativeAxisCode>::new();
+        for axis in [
+            RelativeAxisCode::REL_X,
+            RelativeAxisCode::REL_Y,
+            RelativeAxisCode::REL_WHEEL,
+            RelativeAxisCode::REL_HWHEEL,
+        ] {
+            axes.insert(axis);
+        }
+
+        let relative = VirtualDevice::builder()?
+            .name("computeruse virtual mouse")
+            .with_keys(&keys)?
+            .with_relative_axes(&axes)?
+            .build()?;
+
+        let absolute = VirtualDevice::builder()?
+            .name("computeruse absolute pointer")
+            .with_absolute_axis(&evdev::UinputAbsSetup::new(
+                AbsoluteAxisCode::ABS_X,
+                AbsInfo::new(0, 0, ABS_MAX, 0, 0, 1),
+            ))?
+            .with_absolute_axis(&evdev::UinputAbsSetup::new(
+                AbsoluteAxisCode::ABS_Y,
+                AbsInfo::new(0, 0, ABS_MAX, 0, 0, 1),
+            ))?
+            .build()?;
+
+        Ok(Self { relative, absolute })
+    }
+}
+
+impl MouseBackend for LinuxMouse {
+    type Error = io::Error;
+
+    fn button(&mut self, button: Button, state: ButtonState) -> Result<(), Self::Error> {
+        let value = i32::from(state == ButtonState::Down);
+        self.relative.emit(&[InputEvent::new(
+            EventType::KEY.0,
+            button_key(button).0,
+            value,
+        )])
+    }
+
+    fn move_relative(&mut self, dx: i32, dy: i32) -> Result<(), Self::Error> {
+        self.relative.emit(&[
+            InputEvent::new(EventType::RELATIVE.0, RelativeAxisCode::REL_X.0, dx),
+            InputEvent::new(EventType::RELATIVE.0, RelativeAxisCode::REL_Y.0, dy),
+        ])
+    }
+
+    fn move_absolute(&mut self, x: u16, y: u16) -> Result<(), Self::Error> {
+        self.absolute.emit(&[
+            InputEvent::new(
+                EventType::ABSOLUTE.0,
+                AbsoluteAxisCode::ABS_X.0,
+                i32::from(x),
+            ),
+            InputEvent::new(
+                EventType::ABSOLUTE.0,
+                AbsoluteAxisCode::ABS_Y.0,
+                i32::from(y),
+            ),
+        ])
+    }
+
+    fn wheel(&mut self, delta: i32, horizontal: bool) -> Result<(), Self::Error> {
+        let axis = if horizontal {
+            RelativeAxisCode::REL_HWHEEL
+        } else {
+            RelativeAxisCode::REL_WHEEL
+        };
+        self.relative
+            .emit(&[InputEvent::new(EventType::RELATIVE.0, axis.0, delta)])
+    }
+}
+
+pub struct Listener {
+    devices: Vec<(PathBuf, Device)>,
+}
+
+impl Listener {
+    pub fn new() -> io::Result<Self> {
+        let mut devices = Vec::new();
+        for (path, device) in evdev::enumerate() {
+            if is_mouse(&device) {
+                device.set_nonblocking(true)?;
+                devices.push((path, device));
+            }
+        }
+        if devices.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "no readable mouse devices found under /dev/input; check permissions",
+            ));
+        }
+        Ok(Self { devices })
+    }
+
+    pub fn device_paths(&self) -> impl Iterator<Item = &PathBuf> {
+        self.devices.iter().map(|(path, _)| path)
+    }
+
+    pub fn listen(mut self, mut callback: impl FnMut(MouseEvent)) -> io::Result<()> {
+        self.listen_until(|event| {
+            callback(event);
+            false
+        })
+    }
+
+    /// Listens until the callback returns `true`.
+    pub fn listen_until(&mut self, mut callback: impl FnMut(MouseEvent) -> bool) -> io::Result<()> {
+        loop {
+            let mut had_event = false;
+            for (_, device) in &mut self.devices {
+                match device.fetch_events() {
+                    Ok(events) => {
+                        for event in events {
+                            if let Some(event) = convert_event(event.destructure()) {
+                                had_event = true;
+                                if callback(event) {
+                                    return Ok(());
+                                }
+                            }
+                        }
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            if !had_event {
+                thread::sleep(Duration::from_millis(2));
+            }
+        }
+    }
+}
+
+fn is_mouse(device: &Device) -> bool {
+    device.supported_keys().is_some_and(|keys| {
+        keys.contains(KeyCode::BTN_LEFT)
+            && (keys.contains(KeyCode::BTN_RIGHT) || keys.contains(KeyCode::BTN_MIDDLE))
+    })
+}
+
+fn convert_event(event: EventSummary) -> Option<MouseEvent> {
+    let time = MouseEvent::now();
+    match event {
+        EventSummary::Key(_, key, value) => Some(MouseEvent::Button {
+            button: key_button(key)?,
+            state: if value == 0 {
+                ButtonState::Up
+            } else {
+                ButtonState::Down
+            },
+            time,
+        }),
+        EventSummary::RelativeAxis(_, RelativeAxisCode::REL_X, value) => Some(MouseEvent::Move {
+            dx: value,
+            dy: 0,
+            time,
+        }),
+        EventSummary::RelativeAxis(_, RelativeAxisCode::REL_Y, value) => Some(MouseEvent::Move {
+            dx: 0,
+            dy: value,
+            time,
+        }),
+        EventSummary::RelativeAxis(_, RelativeAxisCode::REL_WHEEL, delta) => {
+            Some(MouseEvent::Wheel {
+                delta,
+                horizontal: false,
+                time,
+            })
+        }
+        EventSummary::RelativeAxis(_, RelativeAxisCode::REL_HWHEEL, delta) => {
+            Some(MouseEvent::Wheel {
+                delta,
+                horizontal: true,
+                time,
+            })
+        }
+        _ => None,
+    }
+}
+
+fn button_key(button: Button) -> KeyCode {
+    match button {
+        Button::Left => KeyCode::BTN_LEFT,
+        Button::Right => KeyCode::BTN_RIGHT,
+        Button::Middle => KeyCode::BTN_MIDDLE,
+        Button::Side => KeyCode::BTN_SIDE,
+        Button::Extra => KeyCode::BTN_EXTRA,
+    }
+}
+
+fn key_button(key: KeyCode) -> Option<Button> {
+    match key {
+        KeyCode::BTN_LEFT => Some(Button::Left),
+        KeyCode::BTN_RIGHT => Some(Button::Right),
+        KeyCode::BTN_MIDDLE => Some(Button::Middle),
+        KeyCode::BTN_SIDE => Some(Button::Side),
+        KeyCode::BTN_EXTRA => Some(Button::Extra),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use evdev::InputEvent;
+
+    #[test]
+    fn converts_linux_button_events() {
+        let event = InputEvent::new(evdev::EventType::KEY.0, KeyCode::BTN_RIGHT.0, 1);
+        assert!(matches!(
+            convert_event(event.destructure()),
+            Some(MouseEvent::Button {
+                button: Button::Right,
+                state: ButtonState::Down,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn ignores_unknown_linux_events() {
+        let event = InputEvent::new(evdev::EventType::SYNCHRONIZATION.0, 0, 0);
+        assert!(convert_event(event.destructure()).is_none());
+    }
+}
