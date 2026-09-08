@@ -2,6 +2,8 @@ use crate::{Button, ButtonState, MouseEvent};
 use std::thread;
 use std::time::Duration;
 
+const CLICK_HOLD_DURATION: Duration = Duration::from_millis(20);
+
 pub trait MouseBackend {
     type Error;
 
@@ -30,6 +32,7 @@ impl<B: MouseBackend> Controller<B> {
 
     pub fn click(&mut self, button: Button) -> Result<(), B::Error> {
         self.press(button)?;
+        thread::sleep(CLICK_HOLD_DURATION);
         self.release(button)
     }
 
