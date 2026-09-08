@@ -12,6 +12,8 @@ use std::thread;
 use std::time::Duration;
 
 const ABS_MAX: i32 = u16::MAX as i32;
+const UINPUT_REGISTRATION_DELAY: Duration = Duration::from_millis(100);
+const UINPUT_DELIVERY_DELAY: Duration = Duration::from_millis(20);
 
 pub struct LinuxMouse {
     relative: VirtualDevice,
@@ -59,7 +61,20 @@ impl LinuxMouse {
             ))?
             .build()?;
 
+        // Input consumers discover uinput devices asynchronously. Without a
+        // short grace period, one-shot commands can emit before libinput has
+        // opened the newly created event node.
+        thread::sleep(UINPUT_REGISTRATION_DELAY);
+
         Ok(Self { relative, absolute })
+    }
+}
+
+impl Drop for LinuxMouse {
+    fn drop(&mut self) {
+        // Keep the event nodes alive long enough for the final report to be
+        // consumed before closing the uinput file descriptors.
+        thread::sleep(UINPUT_DELIVERY_DELAY);
     }
 }
 
