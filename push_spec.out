@@ -1,0 +1,2993 @@
+nohup: ignoring input
+Using spec: /home/opencode/computeruse/push_spec
+[0m
+> build · gpt-5.6-sol
+[0m
+I’ll inspect the current model references, repository documentation, and git state first, then make the smallest consistent update, verify it, and commit and push only the intended files.
+[0m# [0mTodos
+[•] Inspect repository model usage, docs, and git state
+[ ] Refactor usage to gpt-Astra with the smallest change
+[ ] Update README.md and add simple QUICKSTART.md
+[ ] Run relevant verification
+[ ] Commit and push intended changes
+[0m
+[0m✱ [0mGlob "**/*"[90m in . · 100 matches[0m
+[0m✱ [0mGrep "(?i)gpt|model|astra"[90m in . · 5 matches[0m
+[0m→ [0mRead README.md
+[0m
+[0m$ [0mgit status --short --branch && git log --oneline -10 && git remote -v
+## main...origin/main
+M  CONTRIBUTING.md
+M  Cargo.lock
+M  Cargo.toml
+M  README.md
+M  docs/MIGRATION.md
+A  gui_spec
+A  gui_spec.out
+A  homing
+A  homing.out
+A  src/agent.rs
+M  src/controller.rs
+A  src/keyboard.rs
+M  src/lib.rs
+M  src/linux.rs
+M  src/main.rs
+?? push_spec
+?? push_spec.out
+da149c0 Update CI checkout action
+c26a81f Initial Rust mouse automation implementation
+origin	https://github.com/AI10xDev/computeruse/ (fetch)
+origin	https://github.com/AI10xDev/computeruse/ (push)
+[0m
+[0m✱ [0mGrep "GptSol|gpt-5\.6-sol|GPT-Sol|OPENAI|model"[90m in . · 19 matches[0m
+[0m→ [0mRead Cargo.toml
+[0m→ [0mRead src/agent.rs
+[0m→ [0mRead src/main.rs
+[0m
+[0m$ [0mgit diff --stat && git diff --cached --stat && git diff --cached && git status --porcelain=v2
+...output truncated...
+
+Full output saved to: /home/opencode/.local/share/opencode/tool-output/tool_07fe3e6d7001uVHGRVwzb5237G
+
++[0m$ [0mcargo clippy --all-targets --all-features -- -D warnings
++Checking computeruse v0.1.0 (/home/opencode/computeruse)
++    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.17s
++[0m
++[0m# [0mTodos
++[✓] Locate the `play` CLI execution path and pointer movement API
++[✓] Home the pointer to (0, 0) immediately before `play` executes
++[✓] Run targeted tests and inspect the resulting diff
++[0m
++Updated `computeruse play` to home the pointer to normalized `(0, 0)` immediately before playback begins.
++
++- Added `mouse.home()` in the `Play` branch after input validation and JSON decoding.
++- Added contextual error reporting if homing fails.
++- Updated `README.md` to document record/play homing behavior.
++- Left unrelated untracked files unchanged.
++
++Verification passed:
++
++- `cargo fmt --check`
++- `cargo test --all-targets --all-features` with 8 tests passing
++- `cargo clippy --all-targets --all-features -- -D warnings`
++- `git diff --check`
+diff --git a/src/agent.rs b/src/agent.rs
+new file mode 100644
+index 0000000..ba4174c
+--- /dev/null
++++ b/src/agent.rs
+@@ -0,0 +1,405 @@
++use anyhow::{Context, Result, bail};
++use base64::Engine;
++use reqwest::blocking::Client;
++use serde::{Deserialize, Serialize};
++use serde_json::{Value, json};
++use std::collections::{HashMap, VecDeque};
++use std::fs::{self, File};
++use std::io::Read;
++use std::path::{Path, PathBuf};
++use std::thread;
++use std::time::{Duration, Instant};
++
++const MAX_FRAME_BYTES: u64 = 20 * 1024 * 1024;
++
++#[derive(Clone, Debug)]
++pub struct Frame {
++    pub path: PathBuf,
++    pub media_type: &'static str,
++    pub bytes: Vec<u8>,
++}
++
++impl Frame {
++    fn data_url(&self) -> String {
++        format!(
++            "data:{};base64,{}",
++            self.media_type,
++            base64::engine::general_purpose::STANDARD.encode(&self.bytes)
++        )
++    }
++}
++
++pub struct FrameSource {
++    directory: PathBuf,
++    seen: HashMap<PathBuf, FrameIdentity>,
++    trajectory: VecDeque<Frame>,
++    trajectory_len: usize,
++}
++
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++struct FrameIdentity {
++    len: u64,
++    modified: Option<std::time::SystemTime>,
++}
++
++impl FrameSource {
++    pub fn new(directory: impl Into<PathBuf>, trajectory_len: usize) -> Result<Self> {
++        let directory = directory.into();
++        if !directory.is_dir() {
++            bail!("frame directory does not exist: {}", directory.display());
++        }
++        if trajectory_len == 0 {
++            bail!("trajectory length must be greater than zero");
++        }
++        Ok(Self {
++            directory,
++            seen: HashMap::new(),
++            trajectory: VecDeque::new(),
++            trajectory_len,
++        })
++    }
++
++    pub fn next(&mut self, timeout: Duration) -> Result<Option<&VecDeque<Frame>>> {
++        let deadline = Instant::now() + timeout;
++        loop {
++            let paths = self.unseen_paths()?;
++            if !paths.is_empty() {
++                let keep_from = paths.len().saturating_sub(self.trajectory_len);
++                for (path, identity) in &paths[..keep_from] {
++                    self.seen.insert(path.clone(), *identity);
++                }
++                let mut loaded = false;
++                for (path, identity) in paths.into_iter().skip(keep_from) {
++                    match read_stable_frame(&path, identity)? {
++                        Some(frame) => {
++                            self.seen.insert(path, identity);
++                            self.trajectory.push_back(frame);
++                            loaded = true;
++                        }
++                        None => continue,
++                    }
++                }
++                if loaded {
++                    while self.trajectory.len() > self.trajectory_len {
++                        self.trajectory.pop_front();
++                    }
++                    return Ok(Some(&self.trajectory));
++                }
++            }
++            if Instant::now() >= deadline {
++                return Ok(None);
++            }
++            thread::sleep(Duration::from_millis(100));
++        }
++    }
++
++    fn unseen_paths(&self) -> Result<Vec<(PathBuf, FrameIdentity)>> {
++        let mut paths = fs::read_dir(&self.directory)?
++            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
++            .filter_map(|path| {
++                let metadata = fs::metadata(&path).ok()?;
++                let identity = FrameIdentity {
++                    len: metadata.len(),
++                    modified: metadata.modified().ok(),
++                };
++                (media_type(&path).is_some() && self.seen.get(&path) != Some(&identity))
++                    .then_some((path, identity))
++            })
++            .collect::<Vec<_>>();
++        paths.sort_by_cached_key(|(path, identity)| (identity.modified, path.clone()));
++        Ok(paths)
++    }
++}
++
++fn read_stable_frame(path: &Path, identity: FrameIdentity) -> Result<Option<Frame>> {
++    if identity.len > MAX_FRAME_BYTES {
++        bail!(
++            "frame exceeds {} MiB limit: {}",
++            MAX_FRAME_BYTES / 1024 / 1024,
++            path.display()
++        );
++    }
++    let mut bytes = Vec::with_capacity(identity.len as usize);
++    File::open(path)
++        .with_context(|| format!("cannot open frame {}", path.display()))?
++        .take(MAX_FRAME_BYTES + 1)
++        .read_to_end(&mut bytes)
++        .with_context(|| format!("cannot read frame {}", path.display()))?;
++    if bytes.len() as u64 > MAX_FRAME_BYTES {
++        bail!(
++            "frame exceeds {} MiB limit: {}",
++            MAX_FRAME_BYTES / 1024 / 1024,
++            path.display()
++        );
++    }
++    let metadata = fs::metadata(path)?;
++    let after = FrameIdentity {
++        len: metadata.len(),
++        modified: metadata.modified().ok(),
++    };
++    let media_type = media_type(path).expect("path was filtered by media type");
++    if identity != after
++        || bytes.len() as u64 != after.len
++        || !is_complete_image(&bytes, media_type)
++    {
++        return Ok(None);
++    }
++    Ok(Some(Frame {
++        bytes,
++        path: path.to_path_buf(),
++        media_type,
++    }))
++}
++
++fn is_complete_image(bytes: &[u8], media_type: &str) -> bool {
++    match media_type {
++        "image/png" => {
++            bytes.starts_with(b"\x89PNG\r\n\x1a\n")
++                && bytes.len() >= 20
++                && &bytes[bytes.len() - 12..bytes.len() - 4] == b"\0\0\0\0IEND"
++        }
++        "image/jpeg" => bytes.starts_with(b"\xff\xd8") && bytes.ends_with(b"\xff\xd9"),
++        "image/webp" => {
++            bytes.len() >= 12
++                && bytes.starts_with(b"RIFF")
++                && &bytes[8..12] == b"WEBP"
++                && u32::from_le_bytes(bytes[4..8].try_into().expect("four-byte slice")) as usize + 8
++                    == bytes.len()
++        }
++        _ => false,
++    }
++}
++
++fn media_type(path: &Path) -> Option<&'static str> {
++    match path.extension()?.to_str()?.to_ascii_lowercase().as_str() {
++        "png" => Some("image/png"),
++        "jpg" | "jpeg" => Some("image/jpeg"),
++        "webp" => Some("image/webp"),
++        _ => None,
++    }
++}
++
++#[derive(Clone, Debug, Deserialize, Serialize)]
++#[serde(tag = "type", rename_all = "snake_case")]
++pub enum Action {
++    MouseMove { dx: i32, dy: i32 },
++    MouseMoveTo { x: u16, y: u16 },
++    MouseClick { button: crate::Button },
++    Scroll { delta: i32, horizontal: bool },
++    KeyTap { key: String },
++    Hotkey { keys: String },
++    Wait { milliseconds: u64 },
++}
++
++#[derive(Clone, Debug, Deserialize, Serialize)]
++pub struct AgentDecision {
++    #[serde(default)]
++    pub rationale: String,
++    #[serde(default)]
++    pub actions: Vec<Action>,
++    #[serde(default)]
++    pub completed: bool,
++    #[serde(default)]
++    pub progress: f32,
++}
++
++#[derive(Clone, Debug, Serialize)]
++pub struct Transition {
++    pub step: usize,
++    pub frame: PathBuf,
++    pub actions: Vec<Action>,
++    pub progress: f32,
++    pub reward: f32,
++    pub completed: bool,
++    pub executed: bool,
++}
++
++pub trait Policy {
++    fn decide(
++        &self,
++        instructions: &str,
++        trajectory: &VecDeque<Frame>,
++        transitions: &[Transition],
++    ) -> Result<AgentDecision>;
++}
++
++pub struct GptSolPolicy {
++    client: Client,
++    endpoint: String,
++    api_key: String,
++    model: String,
++}
++
++impl GptSolPolicy {
++    pub fn from_env(model: impl Into<String>) -> Result<Self> {
++        let api_key = std::env::var("OPENAI_API_KEY")
++            .context("OPENAI_API_KEY is required for the agent command")?;
++        let base_url =
++            std::env::var("OPENAI_BASE_URL").unwrap_or_else(|_| "https://api.openai.com/v1".into());
++        Ok(Self {
++            client: Client::builder()
++                .timeout(Duration::from_secs(120))
++                .build()?,
++            endpoint: format!("{}/chat/completions", base_url.trim_end_matches('/')),
++            api_key,
++            model: model.into(),
++        })
++    }
++}
++
++impl Policy for GptSolPolicy {
++    fn decide(
++        &self,
++        instructions: &str,
++        trajectory: &VecDeque<Frame>,
++        transitions: &[Transition],
++    ) -> Result<AgentDecision> {
++        let mut content = vec![json!({
++            "type": "text",
++            "text": format!(
++                "GUI instructions:\n{instructions}\n\nPrevious transitions:\n{}",
++                serde_json::to_string(transitions)?
++            )
++        })];
++        for (index, frame) in trajectory.iter().enumerate() {
++            content.push(json!({
++                "type": "text",
++                "text": format!("Trajectory frame {index}: {}", frame.path.display())
++            }));
++            content.push(json!({
++                "type": "image_url",
++                "image_url": { "url": frame.data_url(), "detail": "high" }
++            }));
++        }
++        let body = json!({
++            "model": self.model,
++            "messages": [
++                {
++                    "role": "system",
++                    "content": "Act as a cautious GUI policy. Infer state changes from the ordered frames and return JSON only. Use normalized 0..65535 coordinates for mouse_move_to. Prefer one small, reversible action per observation. Never invent an action type. Set completed only when the latest frame visibly proves the instructions are complete. Output: {\"rationale\":string,\"actions\":[action],\"completed\":bool,\"progress\":number}. Action types: mouse_move(dx,dy), mouse_move_to(x,y), mouse_click(button), scroll(delta,horizontal), key_tap(key), hotkey(keys), wait(milliseconds). Buttons: left, right, middle, side, extra. Named keys and hotkeys use forms such as enter, tab, escape, ctrl+shift+a. Relative movement is limited to +/-32767, scrolling to +/-100, and waits to 30000 milliseconds."
++                },
++                { "role": "user", "content": content }
++            ],
++            "response_format": { "type": "json_object" },
++            "temperature": 0.1
++        });
++        let response = self
++            .client
++            .post(&self.endpoint)
++            .bearer_auth(&self.api_key)
++            .json(&body)
++            .send()
++            .context("GPT-Sol policy request failed")?;
++        let status = response.status();
++        let value: Value = response.json().context("policy response was not JSON")?;
++        if !status.is_success() {
++            bail!("policy request returned {status}: {value}");
++        }
++        let content = value
++            .pointer("/choices/0/message/content")
++            .and_then(Value::as_str)
++            .context("policy response did not contain choices[0].message.content")?;
++        let decision: AgentDecision = parse_decision(content)
++            .with_context(|| format!("policy returned an invalid decision: {content}"))?;
++        if !(0.0..=1.0).contains(&decision.progress) {
++            bail!("policy progress must be between 0 and 1");
++        }
++        Ok(decision)
++    }
++}
++
++fn parse_decision(content: &str) -> Result<AgentDecision, serde_json::Error> {
++    let trimmed = content.trim();
++    let json = if trimmed.starts_with("```") {
++        let without_opening = trimmed
++            .strip_prefix("```json")
++            .or_else(|| trimmed.strip_prefix("```JSON"))
++            .or_else(|| trimmed.strip_prefix("```"))
++            .unwrap_or(trimmed);
++        without_opening
++            .strip_suffix("```")
++            .unwrap_or(without_opening)
++            .trim()
++    } else {
++        trimmed
++    };
++    serde_json::from_str(json)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use std::time::{SystemTime, UNIX_EPOCH};
++
++    #[test]
++    fn action_protocol_round_trips() {
++        let decision = AgentDecision {
++            rationale: "focus the field".into(),
++            actions: vec![Action::Hotkey {
++                keys: "ctrl+l".into(),
++            }],
++            completed: false,
++            progress: 0.25,
++        };
++        let json = serde_json::to_string(&decision).unwrap();
++        let parsed: AgentDecision = serde_json::from_str(&json).unwrap();
++        assert!(matches!(parsed.actions[0], Action::Hotkey { .. }));
++    }
++
++    #[test]
++    fn recognizes_supported_frame_types() {
++        assert_eq!(media_type(Path::new("frame.PNG")), Some("image/png"));
++        assert_eq!(media_type(Path::new("notes.txt")), None);
++    }
++
++    #[test]
++    fn accepts_fenced_policy_json() {
++        let decision =
++            parse_decision("```json\n{\"actions\":[],\"completed\":true,\"progress\":1.0}\n```")
++                .unwrap();
++        assert!(decision.completed);
++    }
++
++    #[test]
++    fn frame_source_starts_with_latest_bounded_trajectory() {
++        let suffix = SystemTime::now()
++            .duration_since(UNIX_EPOCH)
++            .unwrap()
++            .as_nanos();
++        let directory = std::env::temp_dir().join(format!("computeruse-frames-{suffix}"));
++        fs::create_dir(&directory).unwrap();
++        for name in ["001.png", "002.png", "003.png"] {
++            fs::write(directory.join(name), fake_png(name.as_bytes()[0])).unwrap();
++            thread::sleep(Duration::from_millis(2));
++        }
++
++        let mut source = FrameSource::new(&directory, 2).unwrap();
++        let trajectory = source.next(Duration::ZERO).unwrap().unwrap();
++        assert_eq!(trajectory.len(), 2);
++        assert!(trajectory[0].path.ends_with("002.png"));
++        assert!(trajectory[1].path.ends_with("003.png"));
++        assert!(source.next(Duration::ZERO).unwrap().is_none());
++
++        thread::sleep(Duration::from_millis(2));
++        let changed = fake_png(b'x');
++        fs::write(directory.join("003.png"), &changed).unwrap();
++        let trajectory = source.next(Duration::ZERO).unwrap().unwrap();
++        assert_eq!(trajectory.back().unwrap().bytes, changed);
++
++        fs::remove_dir_all(directory).unwrap();
++    }
++
++    #[test]
++    fn rejects_incomplete_image_containers() {
++        assert!(!is_complete_image(b"\x89PNG\r\n\x1a\npartial", "image/png"));
++        assert!(!is_complete_image(b"\xff\xd8partial", "image/jpeg"));
++        assert!(!is_complete_image(b"RIFF\x10\0\0\0WEBP", "image/webp"));
++    }
++
++    fn fake_png(marker: u8) -> Vec<u8> {
++        let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
++        bytes.extend([marker; 4]);
++        bytes.extend(b"\0\0\0\0IEND\0\0\0\0");
++        bytes
++    }
++}
+diff --git a/src/controller.rs b/src/controller.rs
+index a81200b..60e6850 100644
+--- a/src/controller.rs
++++ b/src/controller.rs
+@@ -47,6 +47,11 @@ impl<B: MouseBackend> Controller<B> {
+         self.backend.move_absolute(x, y)
+     }
+ 
++    /// Moves to the normalized desktop origin at the upper-left corner.
++    pub fn home(&mut self) -> Result<(), B::Error> {
++        self.move_absolute(0, 0)
++    }
++
+     pub fn wheel(&mut self, delta: i32) -> Result<(), B::Error> {
+         self.backend.wheel(delta, false)
+     }
+@@ -200,6 +205,13 @@ mod tests {
+         assert_eq!(totals, (7, -5));
+     }
+ 
++    #[test]
++    fn home_moves_to_absolute_origin() {
++        let mut controller = Controller::new(FakeBackend::default());
++        controller.home().unwrap();
++        assert_eq!(controller.backend.0, ["absolute:0,0"]);
++    }
++
+     #[test]
+     fn playback_filter_excludes_requested_event_types() {
+         let events = [
+diff --git a/src/keyboard.rs b/src/keyboard.rs
+new file mode 100644
+index 0000000..41bc530
+--- /dev/null
++++ b/src/keyboard.rs
+@@ -0,0 +1,410 @@
++use serde::{Deserialize, Serialize};
++use std::fmt;
++use std::str::FromStr;
++use std::thread;
++use std::time::{Duration, SystemTime, UNIX_EPOCH};
++
++#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
++pub struct Key {
++    pub name: String,
++    pub scan_code: u16,
++}
++
++impl Key {
++    pub fn from_scan_code(scan_code: u16) -> Self {
++        Self {
++            name: key_name(scan_code),
++            scan_code,
++        }
++    }
++}
++
++impl fmt::Display for Key {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        f.write_str(&self.name)
++    }
++}
++
++impl FromStr for Key {
++    type Err = String;
++
++    fn from_str(value: &str) -> Result<Self, Self::Err> {
++        let normalized = value.trim().to_ascii_lowercase().replace([' ', '-'], "_");
++        let scan_code = parse_key_code(&normalized)
++            .ok_or_else(|| format!("unknown key: {value}; use a key name or code:<number>"))?;
++        Ok(Self {
++            name: normalized,
++            scan_code,
++        })
++    }
++}
++
++#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
++#[serde(rename_all = "snake_case")]
++pub enum KeyState {
++    Up,
++    Down,
++}
++
++#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
++pub struct KeyboardEvent {
++    pub key: Key,
++    pub state: KeyState,
++    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
++    pub repeat: bool,
++    pub time: f64,
++}
++
++impl KeyboardEvent {
++    pub fn now() -> f64 {
++        SystemTime::now()
++            .duration_since(UNIX_EPOCH)
++            .unwrap_or_default()
++            .as_secs_f64()
++    }
++}
++
++pub trait KeyboardBackend {
++    type Error;
++
++    fn key(&mut self, scan_code: u16, state: KeyState) -> Result<(), Self::Error>;
++
++    fn repeat(&mut self, scan_code: u16) -> Result<(), Self::Error> {
++        self.key(scan_code, KeyState::Down)
++    }
++}
++
++pub struct KeyboardController<B> {
++    backend: B,
++}
++
++impl<B: KeyboardBackend> KeyboardController<B> {
++    pub fn new(backend: B) -> Self {
++        Self { backend }
++    }
++
++    pub fn press(&mut self, key: &Key) -> Result<(), B::Error> {
++        self.backend.key(key.scan_code, KeyState::Down)
++    }
++
++    pub fn release(&mut self, key: &Key) -> Result<(), B::Error> {
++        self.backend.key(key.scan_code, KeyState::Up)
++    }
++
++    pub fn send(&mut self, keys: &[Key]) -> Result<(), B::Error> {
++        for (pressed, key) in keys.iter().enumerate() {
++            if let Err(error) = self.press(key) {
++                for key in keys[..pressed].iter().rev() {
++                    let _ = self.release(key);
++                }
++                return Err(error);
++            }
++        }
++        let mut first_error = None;
++        for key in keys.iter().rev() {
++            if let Err(error) = self.release(key)
++                && first_error.is_none()
++            {
++                first_error = Some(error);
++            }
++        }
++        if let Some(error) = first_error {
++            return Err(error);
++        }
++        Ok(())
++    }
++
++    pub fn send_hotkey(&mut self, hotkey: &str) -> Result<(), String>
++    where
++        B::Error: fmt::Display,
++    {
++        let keys = parse_hotkey(hotkey)?;
++        self.send(&keys).map_err(|error| error.to_string())
++    }
++
++    pub fn play(
++        &mut self,
++        events: &[KeyboardEvent],
++        speed: f64,
++        filter: KeyboardPlaybackFilter,
++    ) -> Result<(), B::Error> {
++        let mut previous_time: Option<f64> = None;
++        for event in events {
++            if speed > 0.0
++                && let Some(previous) = previous_time
++            {
++                let delay = ((event.time - previous) / speed).max(0.0);
++                thread::sleep(Duration::from_secs_f64(delay));
++            }
++            previous_time = Some(event.time);
++            if (event.state == KeyState::Down && filter.press)
++                || (event.state == KeyState::Up && filter.release)
++            {
++                if event.repeat {
++                    self.backend.repeat(event.key.scan_code)?;
++                } else {
++                    self.backend.key(event.key.scan_code, event.state)?;
++                }
++            }
++        }
++        Ok(())
++    }
++}
++
++#[derive(Clone, Copy, Debug)]
++pub struct KeyboardPlaybackFilter {
++    pub press: bool,
++    pub release: bool,
++}
++
++impl Default for KeyboardPlaybackFilter {
++    fn default() -> Self {
++        Self {
++            press: true,
++            release: true,
++        }
++    }
++}
++
++pub fn parse_hotkey(value: &str) -> Result<Vec<Key>, String> {
++    let keys: Result<Vec<_>, _> = value.split('+').map(str::parse).collect();
++    let keys = keys?;
++    if keys.is_empty() {
++        return Err("hotkey cannot be empty".into());
++    }
++    Ok(keys)
++}
++
++fn parse_key_code(name: &str) -> Option<u16> {
++    if let Some(code) = name.strip_prefix("code:") {
++        return code.parse().ok();
++    }
++    if name.len() == 1 {
++        let byte = name.as_bytes()[0];
++        if byte.is_ascii_lowercase() {
++            const LETTER_CODES: [u16; 26] = [
++                30, 48, 46, 32, 18, 33, 34, 35, 23, 36, 37, 38, 50, 49, 24, 25, 16, 19, 31, 20, 22,
++                47, 17, 45, 21, 44,
++            ];
++            return Some(LETTER_CODES[(byte - b'a') as usize]);
++        }
++        if byte.is_ascii_digit() {
++            return Some(if byte == b'0' {
++                11
++            } else {
++                u16::from(byte - b'1') + 2
++            });
++        }
++    }
++    if let Some(number) = name
++        .strip_prefix('f')
++        .and_then(|value| value.parse::<u16>().ok())
++        && (1..=10).contains(&number)
++    {
++        return Some(58 + number);
++    }
++    Some(match name {
++        "escape" | "esc" => 1,
++        "minus" => 12,
++        "equal" => 13,
++        "backspace" => 14,
++        "tab" => 15,
++        "left_brace" | "left_bracket" => 26,
++        "right_brace" | "right_bracket" => 27,
++        "enter" | "return" => 28,
++        "left_ctrl" | "ctrl" | "control" => 29,
++        "semicolon" => 39,
++        "apostrophe" | "quote" => 40,
++        "grave" | "backtick" => 41,
++        "left_shift" | "shift" => 42,
++        "backslash" => 43,
++        "comma" => 51,
++        "dot" | "period" => 52,
++        "slash" => 53,
++        "right_shift" => 54,
++        "left_alt" | "alt" => 56,
++        "space" => 57,
++        "caps_lock" => 58,
++        "num_lock" => 69,
++        "scroll_lock" => 70,
++        "f11" => 87,
++        "f12" => 88,
++        "right_ctrl" => 97,
++        "right_alt" | "alt_gr" => 100,
++        "home" => 102,
++        "up" => 103,
++        "page_up" => 104,
++        "left" => 105,
++        "right" => 106,
++        "end" => 107,
++        "down" => 108,
++        "page_down" => 109,
++        "insert" => 110,
++        "delete" => 111,
++        "mute" => 113,
++        "volume_down" => 114,
++        "volume_up" => 115,
++        "left_meta" | "meta" | "super" | "windows" => 125,
++        "right_meta" => 126,
++        "menu" => 139,
++        _ => return None,
++    })
++}
++
++fn key_name(scan_code: u16) -> String {
++    for name in [
++        "escape",
++        "backspace",
++        "tab",
++        "enter",
++        "left_ctrl",
++        "left_shift",
++        "right_shift",
++        "left_alt",
++        "space",
++        "caps_lock",
++        "f1",
++        "f2",
++        "f3",
++        "f4",
++        "f5",
++        "f6",
++        "f7",
++        "f8",
++        "f9",
++        "f10",
++        "f11",
++        "f12",
++        "right_ctrl",
++        "right_alt",
++        "home",
++        "up",
++        "page_up",
++        "left",
++        "right",
++        "end",
++        "down",
++        "page_down",
++        "insert",
++        "delete",
++        "left_meta",
++        "right_meta",
++        "menu",
++    ] {
++        if parse_key_code(name) == Some(scan_code) {
++            return name.into();
++        }
++    }
++    for byte in b'a'..=b'z' {
++        let name = char::from(byte).to_string();
++        if parse_key_code(&name) == Some(scan_code) {
++            return name;
++        }
++    }
++    for byte in b'0'..=b'9' {
++        let name = char::from(byte).to_string();
++        if parse_key_code(&name) == Some(scan_code) {
++            return name;
++        }
++    }
++    format!("code:{scan_code}")
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use std::convert::Infallible;
++
++    #[derive(Default)]
++    struct FakeKeyboard(Vec<(u16, KeyState)>);
++
++    impl KeyboardBackend for FakeKeyboard {
++        type Error = Infallible;
++
++        fn key(&mut self, scan_code: u16, state: KeyState) -> Result<(), Self::Error> {
++            self.0.push((scan_code, state));
++            Ok(())
++        }
++
++        fn repeat(&mut self, scan_code: u16) -> Result<(), Self::Error> {
++            self.0.push((scan_code, KeyState::Down));
++            Ok(())
++        }
++    }
++
++    #[test]
++    fn hotkey_presses_in_order_and_releases_in_reverse() {
++        let mut keyboard = KeyboardController::new(FakeKeyboard::default());
++        keyboard.send_hotkey("ctrl+shift+a").unwrap();
++        assert_eq!(
++            keyboard.backend.0,
++            [
++                (29, KeyState::Down),
++                (42, KeyState::Down),
++                (30, KeyState::Down),
++                (30, KeyState::Up),
++                (42, KeyState::Up),
++                (29, KeyState::Up),
++            ]
++        );
++    }
++
++    #[test]
++    fn key_events_round_trip() {
++        let event = KeyboardEvent {
++            key: "enter".parse().unwrap(),
++            state: KeyState::Down,
++            repeat: false,
++            time: 1.5,
++        };
++        let json = serde_json::to_string(&event).unwrap();
++        assert_eq!(serde_json::from_str::<KeyboardEvent>(&json).unwrap(), event);
++    }
++
++    #[test]
++    fn playback_emits_repeat_events() {
++        let event = KeyboardEvent {
++            key: "a".parse().unwrap(),
++            state: KeyState::Down,
++            repeat: true,
++            time: 1.0,
++        };
++        let mut keyboard = KeyboardController::new(FakeKeyboard::default());
++        keyboard
++            .play(&[event], 0.0, KeyboardPlaybackFilter::default())
++            .unwrap();
++        assert_eq!(keyboard.backend.0, [(30, KeyState::Down)]);
++    }
++
++    #[test]
++    fn hotkey_releases_pressed_modifiers_after_backend_failure() {
++        struct FailingKeyboard(Vec<(u16, KeyState)>);
++
++        impl KeyboardBackend for FailingKeyboard {
++            type Error = &'static str;
++
++            fn key(&mut self, scan_code: u16, state: KeyState) -> Result<(), Self::Error> {
++                if scan_code == 30 && state == KeyState::Down {
++                    return Err("injection failed");
++                }
++                self.0.push((scan_code, state));
++                Ok(())
++            }
++        }
++
++        let mut keyboard = KeyboardController::new(FailingKeyboard(Vec::new()));
++        assert_eq!(
++            keyboard.send_hotkey("ctrl+shift+a"),
++            Err("injection failed".into())
++        );
++        assert_eq!(
++            keyboard.backend.0,
++            [
++                (29, KeyState::Down),
++                (42, KeyState::Down),
++                (42, KeyState::Up),
++                (29, KeyState::Up),
++            ]
++        );
++    }
++}
+diff --git a/src/lib.rs b/src/lib.rs
+index 12a685d..2737f72 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -3,14 +3,20 @@
+ //! The Linux implementation uses the kernel `evdev` and `uinput` interfaces,
+ //! so it does not depend on X11 and works with both Xorg and Wayland sessions.
+ 
++mod agent;
+ mod controller;
+ mod event;
++mod keyboard;
+ 
+ #[cfg(target_os = "linux")]
+ mod linux;
+ 
++pub use agent::{Action, AgentDecision, Frame, FrameSource, GptSolPolicy, Policy, Transition};
+ pub use controller::{Controller, MouseBackend, PlaybackFilter};
+ pub use event::{Button, ButtonState, MouseEvent};
++pub use keyboard::{
++    Key, KeyState, KeyboardBackend, KeyboardController, KeyboardEvent, KeyboardPlaybackFilter,
++};
+ 
+ #[cfg(target_os = "linux")]
+-pub use linux::{LinuxMouse, Listener};
++pub use linux::{KeyboardListener, LinuxKeyboard, LinuxMouse, Listener};
+diff --git a/src/linux.rs b/src/linux.rs
+index 2b67242..2d760b2 100644
+--- a/src/linux.rs
++++ b/src/linux.rs
+@@ -1,4 +1,6 @@
+-use crate::{Button, ButtonState, MouseBackend, MouseEvent};
++use crate::{
++    Button, ButtonState, Key, KeyState, KeyboardBackend, KeyboardEvent, MouseBackend, MouseEvent,
++};
+ use evdev::uinput::VirtualDevice;
+ use evdev::{
+     AbsInfo, AbsoluteAxisCode, AttributeSet, Device, EventSummary, EventType, InputEvent, KeyCode,
+@@ -106,10 +108,125 @@ impl MouseBackend for LinuxMouse {
+     }
+ }
+ 
++pub struct LinuxKeyboard {
++    device: VirtualDevice,
++}
++
++impl LinuxKeyboard {
++    pub fn new() -> io::Result<Self> {
++        let mut keys = AttributeSet::<KeyCode>::new();
++        for code in 1..=0x2ff {
++            if is_keyboard_code(code) {
++                keys.insert(KeyCode::new(code));
++            }
++        }
++        let device = VirtualDevice::builder()?
++            .name("computeruse virtual keyboard")
++            .with_keys(&keys)?
++            .build()?;
++        Ok(Self { device })
++    }
++
++    pub fn supports_scan_code(scan_code: u16) -> bool {
++        is_keyboard_code(scan_code)
++    }
++}
++
++impl KeyboardBackend for LinuxKeyboard {
++    type Error = io::Error;
++
++    fn key(&mut self, scan_code: u16, state: KeyState) -> Result<(), Self::Error> {
++        if !is_keyboard_code(scan_code) {
++            return Err(io::Error::new(
++                io::ErrorKind::InvalidInput,
++                format!("scan code {scan_code} is not a supported Linux keyboard key"),
++            ));
++        }
++        self.device.emit(&[InputEvent::new(
++            EventType::KEY.0,
++            scan_code,
++            i32::from(state == KeyState::Down),
++        )])
++    }
++
++    fn repeat(&mut self, scan_code: u16) -> Result<(), Self::Error> {
++        if !is_keyboard_code(scan_code) {
++            return Err(io::Error::new(
++                io::ErrorKind::InvalidInput,
++                format!("scan code {scan_code} is not a supported Linux keyboard key"),
++            ));
++        }
++        self.device
++            .emit(&[InputEvent::new(EventType::KEY.0, scan_code, 2)])
++    }
++}
++
+ pub struct Listener {
+     devices: Vec<(PathBuf, Device)>,
+ }
+ 
++pub struct KeyboardListener {
++    devices: Vec<(PathBuf, Device)>,
++}
++
++impl KeyboardListener {
++    pub fn new() -> io::Result<Self> {
++        let mut devices = Vec::new();
++        for (path, device) in evdev::enumerate() {
++            if is_keyboard(&device) {
++                device.set_nonblocking(true)?;
++                devices.push((path, device));
++            }
++        }
++        if devices.is_empty() {
++            return Err(io::Error::new(
++                io::ErrorKind::NotFound,
++                "no readable keyboard devices found under /dev/input; check permissions",
++            ));
++        }
++        Ok(Self { devices })
++    }
++
++    pub fn device_paths(&self) -> impl Iterator<Item = &PathBuf> {
++        self.devices.iter().map(|(path, _)| path)
++    }
++
++    pub fn listen(mut self, mut callback: impl FnMut(KeyboardEvent)) -> io::Result<()> {
++        self.listen_until(|event| {
++            callback(event);
++            false
++        })
++    }
++
++    pub fn listen_until(
++        &mut self,
++        mut callback: impl FnMut(KeyboardEvent) -> bool,
++    ) -> io::Result<()> {
++        loop {
++            let mut had_event = false;
++            for (_, device) in &mut self.devices {
++                match device.fetch_events() {
++                    Ok(events) => {
++                        for event in events {
++                            if let Some(event) = convert_keyboard_event(event) {
++                                had_event = true;
++                                if callback(event) {
++                                    return Ok(());
++                                }
++                            }
++                        }
++                    }
++                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
++                    Err(error) => return Err(error),
++                }
++            }
++            if !had_event {
++                thread::sleep(Duration::from_millis(2));
++            }
++        }
++    }
++}
++
+ impl Listener {
+     pub fn new() -> io::Result<Self> {
+         let mut devices = Vec::new();
+@@ -173,6 +290,42 @@ fn is_mouse(device: &Device) -> bool {
+     })
+ }
+ 
++fn is_keyboard(device: &Device) -> bool {
++    device.supported_keys().is_some_and(|keys| {
++        keys.contains(KeyCode::KEY_A)
++            && keys.contains(KeyCode::KEY_Z)
++            && keys.contains(KeyCode::KEY_ENTER)
++            && keys.contains(KeyCode::KEY_SPACE)
++    })
++}
++
++fn is_keyboard_code(code: u16) -> bool {
++    (1..=0x2ff).contains(&code) && !(0x100..=0x15f).contains(&code)
++}
++
++fn convert_keyboard_event(event: InputEvent) -> Option<KeyboardEvent> {
++    let time = event
++        .timestamp()
++        .duration_since(std::time::UNIX_EPOCH)
++        .unwrap_or_default()
++        .as_secs_f64();
++    match event.destructure() {
++        EventSummary::Key(_, key, value) if is_keyboard_code(key.code()) && value >= 0 => {
++            Some(KeyboardEvent {
++                key: Key::from_scan_code(key.code()),
++                state: if value == 0 {
++                    KeyState::Up
++                } else {
++                    KeyState::Down
++                },
++                repeat: value == 2,
++                time,
++            })
++        }
++        _ => None,
++    }
++}
++
+ fn convert_event(event: EventSummary) -> Option<MouseEvent> {
+     let time = MouseEvent::now();
+     match event {
+@@ -257,4 +410,18 @@ mod tests {
+         let event = InputEvent::new(evdev::EventType::SYNCHRONIZATION.0, 0, 0);
+         assert!(convert_event(event.destructure()).is_none());
+     }
++
++    #[test]
++    fn converts_linux_keyboard_events_and_repeats() {
++        let event = InputEvent::new(evdev::EventType::KEY.0, KeyCode::KEY_A.0, 2);
++        assert!(matches!(
++            convert_keyboard_event(event),
++            Some(KeyboardEvent {
++                key: Key { scan_code: 30, .. },
++                state: KeyState::Down,
++                repeat: true,
++                ..
++            })
++        ));
++    }
+ }
+diff --git a/src/main.rs b/src/main.rs
+index 3bf9660..ae69fdb 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -1,9 +1,15 @@
+ use anyhow::{Context, Result, bail};
+ use clap::{Parser, Subcommand};
+-use computeruse::{Button, Controller, LinuxMouse, Listener, MouseEvent, PlaybackFilter};
+-use std::fs::File;
+-use std::io::{BufReader, BufWriter};
++use computeruse::{
++    Action, Button, Controller, FrameSource, GptSolPolicy, Key, KeyState, KeyboardController,
++    KeyboardEvent, KeyboardListener, KeyboardPlaybackFilter, LinuxKeyboard, LinuxMouse, Listener,
++    MouseEvent, PlaybackFilter, Policy, Transition,
++};
++use serde::Serialize;
++use std::fs::{self, File, OpenOptions};
++use std::io::{BufReader, BufWriter, Write};
+ use std::path::PathBuf;
++use std::thread;
+ use std::time::Duration;
+ 
+ #[derive(Parser)]
+@@ -63,6 +69,52 @@ enum Command {
+         #[arg(long)]
+         no_wheel: bool,
+     },
++    KeyPress {
++        key: Key,
++    },
++    KeyRelease {
++        key: Key,
++    },
++    Hotkey {
++        /// Simultaneous keys, for example `ctrl+shift+a`.
++        keys: String,
++    },
++    KeyboardListen,
++    KeyboardRecord {
++        output: PathBuf,
++        #[arg(long, default_value = "escape")]
++        stop_key: Key,
++    },
++    KeyboardPlay {
++        input: PathBuf,
++        #[arg(long, default_value_t = 1.0)]
++        speed: f64,
++        #[arg(long)]
++        no_press: bool,
++        #[arg(long)]
++        no_release: bool,
++    },
++    /// Run the instruction-driven visual policy over screencast frames.
++    Agent {
++        #[arg(long)]
++        frames: PathBuf,
++        #[arg(long)]
++        instructions: PathBuf,
++        #[arg(long, default_value = "gpt-5.6-sol")]
++        model: String,
++        #[arg(long, default_value_t = 3)]
++        trajectory: usize,
++        #[arg(long, default_value_t = 50)]
++        max_steps: usize,
++        #[arg(long, default_value_t = 10_000)]
++        frame_timeout_ms: u64,
++        /// Actually inject policy actions. Without this flag the agent is a dry run.
++        #[arg(long)]
++        execute: bool,
++        /// Optional JSONL transition log for evaluation or offline learning.
++        #[arg(long)]
++        trace: Option<PathBuf>,
++    },
+ }
+ 
+ fn main() -> Result<()> {
+@@ -75,6 +127,30 @@ fn main() -> Result<()> {
+             output,
+             stop_button,
+         } => record(output, stop_button),
++        Command::KeyboardListen => {
++            KeyboardListener::new()?.listen(|event| println_json(&event))?;
++            Ok(())
++        }
++        Command::KeyboardRecord { output, stop_key } => keyboard_record(output, stop_key),
++        Command::Agent {
++            frames,
++            instructions,
++            model,
++            trajectory,
++            max_steps,
++            frame_timeout_ms,
++            execute,
++            trace,
++        } => run_agent(AgentOptions {
++            frames,
++            instructions,
++            model,
++            trajectory,
++            max_steps,
++            frame_timeout: Duration::from_millis(frame_timeout_ms),
++            execute,
++            trace,
++        }),
+         command => control(command),
+     }
+ }
+@@ -119,6 +195,9 @@ fn control(command: Command) -> Result<()> {
+                     .with_context(|| format!("cannot open recording at {}", input.display()))?,
+             );
+             let events: Vec<MouseEvent> = serde_json::from_reader(reader)?;
++            mouse
++                .home()
++                .context("cannot move mouse to the home position before playback")?;
+             mouse.play(
+                 &events,
+                 speed,
+@@ -129,13 +208,252 @@ fn control(command: Command) -> Result<()> {
+                 },
+             )?;
+         }
+-        Command::Listen | Command::Record { .. } => unreachable!(),
++        Command::KeyPress { key } => KeyboardController::new(
++            LinuxKeyboard::new()
++                .context("cannot create virtual keyboard; check /dev/uinput permissions")?,
++        )
++        .press(&key)?,
++        Command::KeyRelease { key } => KeyboardController::new(
++            LinuxKeyboard::new()
++                .context("cannot create virtual keyboard; check /dev/uinput permissions")?,
++        )
++        .release(&key)?,
++        Command::Hotkey { keys } => KeyboardController::new(
++            LinuxKeyboard::new()
++                .context("cannot create virtual keyboard; check /dev/uinput permissions")?,
++        )
++        .send_hotkey(&keys)
++        .map_err(anyhow::Error::msg)?,
++        Command::KeyboardPlay {
++            input,
++            speed,
++            no_press,
++            no_release,
++        } => {
++            if speed < 0.0 {
++                bail!("speed must be zero or greater");
++            }
++            let reader = BufReader::new(
++                File::open(&input)
++                    .with_context(|| format!("cannot open recording at {}", input.display()))?,
++            );
++            let events: Vec<KeyboardEvent> = serde_json::from_reader(reader)?;
++            KeyboardController::new(
++                LinuxKeyboard::new()
++                    .context("cannot create virtual keyboard; check /dev/uinput permissions")?,
++            )
++            .play(
++                &events,
++                speed,
++                KeyboardPlaybackFilter {
++                    press: !no_press,
++                    release: !no_release,
++                },
++            )?;
++        }
++        Command::Listen
++        | Command::Record { .. }
++        | Command::KeyboardListen
++        | Command::KeyboardRecord { .. }
++        | Command::Agent { .. } => unreachable!(),
++    }
++    Ok(())
++}
++
++fn keyboard_record(output: PathBuf, stop_key: Key) -> Result<()> {
++    let mut listener = KeyboardListener::new()?;
++    let mut events = Vec::new();
++    let mut stop_pressed = false;
++    listener.listen_until(|event| {
++        if event.key.scan_code == stop_key.scan_code
++            && event.state == KeyState::Down
++            && !event.repeat
++        {
++            stop_pressed = true;
++        }
++        let stopped = stop_pressed
++            && event.key.scan_code == stop_key.scan_code
++            && event.state == KeyState::Up;
++        events.push(event);
++        stopped
++    })?;
++    events.sort_by(|left, right| left.time.total_cmp(&right.time));
++    let file = File::create(&output)
++        .with_context(|| format!("cannot create recording at {}", output.display()))?;
++    serde_json::to_writer_pretty(BufWriter::new(file), &events)?;
++    Ok(())
++}
++
++struct AgentOptions {
++    frames: PathBuf,
++    instructions: PathBuf,
++    model: String,
++    trajectory: usize,
++    max_steps: usize,
++    frame_timeout: Duration,
++    execute: bool,
++    trace: Option<PathBuf>,
++}
++
++fn run_agent(options: AgentOptions) -> Result<()> {
++    let instructions = fs::read_to_string(&options.instructions).with_context(|| {
++        format!(
++            "cannot read GUI instructions at {}",
++            options.instructions.display()
++        )
++    })?;
++    let mut frames = FrameSource::new(options.frames, options.trajectory)?;
++    let policy = GptSolPolicy::from_env(options.model)?;
++    let mut transitions = Vec::new();
++    let mut previous_progress = 0.0;
++    let mut devices = if options.execute {
++        Some((
++            Controller::new(
++                LinuxMouse::new()
++                    .context("cannot create virtual mouse; check /dev/uinput permissions")?,
++            ),
++            KeyboardController::new(
++                LinuxKeyboard::new()
++                    .context("cannot create virtual keyboard; check /dev/uinput permissions")?,
++            ),
++        ))
++    } else {
++        None
++    };
++
++    for step in 0..options.max_steps {
++        let trajectory = frames
++            .next(options.frame_timeout)?
++            .with_context(|| format!("timed out waiting for a new frame at step {step}"))?;
++        let frame = trajectory
++            .back()
++            .expect("trajectory has a new frame")
++            .path
++            .clone();
++        let decision = policy.decide(&instructions, trajectory, &transitions)?;
++        if decision.actions.len() > 16 {
++            bail!("policy proposed more than 16 actions in one step");
++        }
++        validate_actions(&decision.actions)?;
++        if let Some((mouse, keyboard)) = &mut devices {
++            execute_actions(mouse, keyboard, &decision.actions)?;
++        }
++        let progress = decision.progress.clamp(0.0, 1.0);
++        let transition = Transition {
++            step,
++            frame,
++            actions: decision.actions,
++            progress,
++            reward: progress - previous_progress,
++            completed: decision.completed,
++            executed: options.execute,
++        };
++        previous_progress = progress;
++        println_json(&transition);
++        if let Some(path) = &options.trace {
++            append_json_line(path, &transition)?;
++        }
++        let completed = transition.completed;
++        transitions.push(transition);
++        if completed {
++            return Ok(());
++        }
++    }
++    bail!("agent reached max steps without completing the instructions")
++}
++
++fn execute_actions(
++    mouse: &mut Controller<LinuxMouse>,
++    keyboard: &mut KeyboardController<LinuxKeyboard>,
++    actions: &[Action],
++) -> Result<()> {
++    for action in actions {
++        match action {
++            Action::MouseMove { dx, dy } => mouse.move_relative(*dx, *dy)?,
++            Action::MouseMoveTo { x, y } => mouse.move_absolute(*x, *y)?,
++            Action::MouseClick { button } => mouse.click(*button)?,
++            Action::Scroll { delta, horizontal } if *horizontal => {
++                mouse.horizontal_wheel(*delta)?
++            }
++            Action::Scroll { delta, .. } => mouse.wheel(*delta)?,
++            Action::KeyTap { key } => keyboard.send_hotkey(key).map_err(anyhow::Error::msg)?,
++            Action::Hotkey { keys } => keyboard.send_hotkey(keys).map_err(anyhow::Error::msg)?,
++            Action::Wait { milliseconds } => {
++                if *milliseconds > 30_000 {
++                    bail!("policy wait action exceeds 30 seconds");
++                }
++                thread::sleep(Duration::from_millis(*milliseconds));
++            }
++        }
++    }
++    Ok(())
++}
++
++fn validate_actions(actions: &[Action]) -> Result<()> {
++    for action in actions {
++        match action {
++            Action::MouseMove { dx, dy }
++                if dx.unsigned_abs() > 32_767 || dy.unsigned_abs() > 32_767 =>
++            {
++                bail!("policy relative mouse movement exceeds +/-32767")
++            }
++            Action::Scroll { delta, .. } if delta.unsigned_abs() > 100 => {
++                bail!("policy scroll action exceeds +/-100")
++            }
++            Action::KeyTap { key } => {
++                validate_policy_key(key)?;
++            }
++            Action::Hotkey { keys } => {
++                let parsed = keys
++                    .split('+')
++                    .map(str::parse::<Key>)
++                    .collect::<Result<Vec<_>, _>>()
++                    .map_err(anyhow::Error::msg)?;
++                if parsed.is_empty() {
++                    bail!("policy hotkey cannot be empty");
++                }
++                if let Some(key) = parsed
++                    .iter()
++                    .find(|key| !LinuxKeyboard::supports_scan_code(key.scan_code))
++                {
++                    bail!("policy key is not injectable on Linux: {key}");
++                }
++            }
++            Action::Wait { milliseconds } if *milliseconds > 30_000 => {
++                bail!("policy wait action exceeds 30 seconds")
++            }
++            _ => {}
++        }
++    }
++    Ok(())
++}
++
++fn validate_policy_key(value: &str) -> Result<Key> {
++    let key = value.parse::<Key>().map_err(anyhow::Error::msg)?;
++    if !LinuxKeyboard::supports_scan_code(key.scan_code) {
++        bail!("policy key is not injectable on Linux: {key}");
+     }
++    Ok(key)
++}
++
++fn append_json_line(path: &PathBuf, value: &impl Serialize) -> Result<()> {
++    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
++    serde_json::to_writer(&mut file, value)?;
++    file.write_all(b"\n")?;
+     Ok(())
+ }
+ 
+ fn record(output: PathBuf, stop_button: Button) -> Result<()> {
++    // Open physical devices before creating uinput devices so recording cannot
++    // include events from the virtual mouse used for homing.
+     let mut listener = Listener::new()?;
++    let mut mouse = Controller::new(
++        LinuxMouse::new().context("cannot create uinput device; check /dev/uinput permissions")?,
++    );
++    mouse
++        .home()
++        .context("cannot move mouse to the home position before recording")?;
++
+     let mut events = Vec::new();
+     listener.listen_until(|event| {
+         let stopped = matches!(
+@@ -155,9 +473,44 @@ fn record(output: PathBuf, stop_button: Button) -> Result<()> {
+     Ok(())
+ }
+ 
+-fn println_json(event: &MouseEvent) {
++fn println_json(event: &impl Serialize) {
+     println!(
+         "{}",
+         serde_json::to_string(event).expect("event is serializable")
+     );
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn agent_actions_are_validated_before_execution() {
++        assert!(validate_actions(&[Action::MouseMove { dx: 32_768, dy: 0 }]).is_err());
++        assert!(
++            validate_actions(&[Action::Wait {
++                milliseconds: 30_001,
++            }])
++            .is_err()
++        );
++        assert!(
++            validate_actions(&[Action::KeyTap {
++                key: "code:65535".into(),
++            }])
++            .is_err()
++        );
++        assert!(
++            validate_actions(&[
++                Action::MouseMove { dx: -32_767, dy: 1 },
++                Action::Scroll {
++                    delta: 100,
++                    horizontal: false,
++                },
++                Action::Hotkey {
++                    keys: "ctrl+a".into(),
++                },
++            ])
++            .is_ok()
++        );
++    }
++}
+1 M. N... 100644 100644 100644 b181c7f267a3aeca31212f3c5be95ba74e31d7a0 db6430217880c599643ea9a632f5205ebd676781 CONTRIBUTING.md
+1 M. N... 100644 100644 100644 9b99be03d1af532167ae4642b810c96191f1cfc9 b1b91980478371df030bd1d770f263b1924b20ae Cargo.lock
+1 M. N... 100644 100644 100644 ec949a10b317605b24867c09ea6d902acb8a2157 74e28acb78022284e56ca0bb5c14c8239621d6b6 Cargo.toml
+1 M. N... 100644 100644 100644 7ecfe0acbfc3daa730ebb2b5ea50540f649501fa 384d89237addf6e7eb6f2873cf609ffba2a8f876 README.md
+1 M. N... 100644 100644 100644 f1dd6ee805a7b0acc54cbf3908fabdbff4fbe1a5 e7dd9d1f10e45c63b64f4bef7dd438f8dd09d0a4 docs/MIGRATION.md
+1 A. N... 000000 100644 100644 0000000000000000000000000000000000000000 4386824f2cfb79253e68f9f65fe6688c26322e10 gui_spec
+1 A. N... 000000 100644 100644 0000000000000000000000000000000000000000 57402c3d3aa53269d0bd98ddadb42e51e8fdfa28 gui_spec.out
+1 A. N... 000000 100644 100644 0000000000000000000000000000000000000000 200e48e117aecadf240c8ebabf434059cf552350 homing
+1 A. N... 000000 100644 100644 0000000000000000000000000000000000000000 e67f5cbaff7b420a0a0322e3ad744ae162dc0907 homing.out
+1 A. N... 000000 100644 100644 0000000000000000000000000000000000000000 ba4174cd457757011298b6407089221f1b215e59 src/agent.rs
+1 M. N... 100644 100644 100644 a81200b0b7646483ebdbd63517b4f4a801e39d82 60e6850524244a9eaf95adf5ef99926d8e3a50ee src/controller.rs
+1 A. N... 000000 100644 100644 0000000000000000000000000000000000000000 41bc530194eb5c2b47293775d29cf1f93ee87f25 src/keyboard.rs
+1 M. N... 100644 100644 100644 12a685dbd413e38eccb0e50465c68c946ae035c6 2737f724506b0d1f508bd69f81ba2b97cf6a30c7 src/lib.rs
+1 M. N... 100644 100644 100644 2b67242b7c4a35e4a8e524a1f1601695700e943c 2d760b216ce45861b2f297baea9ec9c5d9234671 src/linux.rs
+1 M. N... 100644 100644 100644 3bf96604e0bbc2c7b3aa3434fa6e9baaa0e7e187 ae69fdb517db2df6f1bee2cdb158526ca325c9b3 src/main.rs
+? push_spec
+? push_spec.out
+[0m
+The visual-agent implementation currently hard-codes `gpt-5.6-sol` and names its policy `GptSolPolicy`. I’ll make the narrow rename to `GptAstraPolicy`, set the default model to `gpt-Astra`, update the existing agent documentation, and add a short runnable quickstart without changing the API protocol or agent behavior.
+[0m# [0mTodos
+[✓] Inspect repository model usage, docs, and git state
+[•] Refactor usage to gpt-Astra with the smallest change
+[ ] Update README.md and add simple QUICKSTART.md
+[ ] Run relevant verification
+[ ] Commit and push intended changes
+[0m
+[0m→ [0mRead gui_spec
+[0m→ [0mRead gui_spec.out[90m [limit=80][0m
+[0m→ [0mRead homing[90m [limit=80][0m
+[0m→ [0mRead homing.out[90m [limit=80][0m
+[0m→ [0mRead push_spec[90m [limit=80][0m
+[0m→ [0mRead .gitignore
+[0m→ [0mRead push_spec.out[90m [limit=80][0m
+I’m editing only the model-facing names/default and documentation. Existing staged implementation work will remain intact; the generated `push_spec` run files are untracked and will not be added to the commit.
+[0m% [0mPatch 5 files
+[0m
+[0m# [0mTodos
+[✓] Inspect repository model usage, docs, and git state
+[✓] Refactor usage to gpt-Astra with the smallest change
+[✓] Update README.md and add simple QUICKSTART.md
+[•] Run relevant verification
+[ ] Commit and push intended changes
+[0m
+The refactor and docs are in place. I’m now checking formatting, tests, linting, documentation generation, stale model references in maintained source/docs, and the exact commit contents before pushing.
+[0m$ [0mgit diff --check && git diff --cached --check
+gui_spec:3: trailing whitespace.
++#use the frames (state trajactory estimation) as input to a reinforcement learning framework (using gpt-sol) to action the key events (mouse, keyboard) -- given a file of instruction on gui & ui/ux steps   
+gui_spec.out:47: trailing whitespace.
++ 
+gui_spec.out:53: trailing whitespace.
++ 
+gui_spec.out:57: trailing whitespace.
++ 
+gui_spec.out:67: trailing whitespace.
++ 
+gui_spec.out:69: trailing whitespace.
++ 
+gui_spec.out:77: trailing whitespace.
++ 
+gui_spec.out:89: trailing whitespace.
++ 
+gui_spec.out:116: trailing whitespace.
++ 
+gui_spec.out:556: trailing whitespace.
++ 
+gui_spec.out:598: trailing whitespace.
++ 
+gui_spec.out:649: trailing whitespace.
++ 
+gui_spec.out:655: trailing whitespace.
++ 
+gui_spec.out:659: trailing whitespace.
++ 
+gui_spec.out:860: trailing whitespace.
++  click            
+gui_spec.out:861: trailing whitespace.
++  press            
+gui_spec.out:862: trailing whitespace.
++  release          
+gui_spec.out:863: trailing whitespace.
++  move             
+gui_spec.out:864: trailing whitespace.
++  move-to          
+gui_spec.out:865: trailing whitespace.
++  wheel            
+gui_spec.out:866: trailing whitespace.
++  listen           
+gui_spec.out:867: trailing whitespace.
++  record           
+gui_spec.out:868: trailing whitespace.
++  play             
+gui_spec.out:869: trailing whitespace.
++  key-press        
+gui_spec.out:870: trailing whitespace.
++  key-release      
+gui_spec.out:871: trailing whitespace.
++  hotkey           
+gui_spec.out:872: trailing whitespace.
++  keyboard-listen  
+gui_spec.out:873: trailing whitespace.
++  keyboard-record  
+gui_spec.out:874: trailing whitespace.
++  keyboard-play    
+gui_spec.out:928: trailing whitespace.
++          
+gui_spec.out:930: trailing whitespace.
++          
+gui_spec.out:1186: trailing whitespace.
++  click            
+gui_spec.out:1187: trailing whitespace.
++  press            
+gui_spec.out:1188: trailing whitespace.
++  release          
+gui_spec.out:1189: trailing whitespace.
++  move             
+gui_spec.out:1190: trailing whitespace.
++  move-to          
+gui_spec.out:1191: trailing whitespace.
++  wheel            
+gui_spec.out:1192: trailing whitespace.
++  listen           
+gui_spec.out:1193: trailing whitespace.
++  record           
+gui_spec.out:1194: trailing whitespace.
++  play             
+gui_spec.out:1195: trailing whitespace.
++  key-press        
+gui_spec.out:1196: trailing whitespace.
++  key-release      
+gui_spec.out:1197: trailing whitespace.
++  hotkey           
+gui_spec.out:1198: trailing whitespace.
++  keyboard-listen  
+gui_spec.out:1199: trailing whitespace.
++  keyboard-record  
+gui_spec.out:1200: trailing whitespace.
++  keyboard-play    
+homing:3: trailing whitespace.
++#use the frames (state trajactory estimation) as input to a reinforcement learning framework (using gpt-sol) to action the key events (mouse, keyboard) -- given a file of instruction on gui & ui/ux steps   
+homing.out:33: trailing whitespace.
++ 
+homing.out:45: trailing whitespace.
++ 
+homing.out:62: trailing whitespace.
++ 
+homing.out:129: trailing whitespace.
++ 
+homing.out:135: trailing whitespace.
++ 
+homing.out:139: trailing whitespace.
++ 
+homing.out:149: trailing whitespace.
++ 
+homing.out:151: trailing whitespace.
++ 
+homing.out:159: trailing whitespace.
++ 
+homing.out:171: trailing whitespace.
++ 
+homing.out:198: trailing whitespace.
++
+[0m
+[0m✱ [0mGrep "GptSol|gpt-5\.6-sol|GPT-Sol"[90m in . · 0 matches[0m
+[0m✱ [0mGrep "GptSol|gpt-5\.6-sol|GPT-Sol"[90m in src · 0 matches[0m
+[0m
+[0m$ [0mcargo fmt --check
+(no output)
+[0m
+[0m$ [0mcargo clippy --all-targets --all-features -- -D warnings
+Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Checking computeruse v0.1.0 (/home/opencode/computeruse)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.74s
+[0m
+[0m$ [0mcargo doc --no-deps
+Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on build directory
+ Documenting computeruse v0.1.0 (/home/opencode/computeruse)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.52s
+   Generated /home/opencode/computeruse/target/doc/computeruse/index.html
+[0m
+[0m$ [0mcargo test --all-targets --all-features
+Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on build directory
+   Compiling computeruse v0.1.0 (/home/opencode/computeruse)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.43s
+     Running unittests src/lib.rs (target/debug/deps/computeruse-0b4a1abf3c1aab6f)
+
+running 18 tests
+test agent::tests::accepts_fenced_policy_json ... ok
+test agent::tests::action_protocol_round_trips ... ok
+test agent::tests::recognizes_supported_frame_types ... ok
+test agent::tests::rejects_incomplete_image_containers ... ok
+test controller::tests::click_and_double_click_preserve_order ... ok
+test controller::tests::home_moves_to_absolute_origin ... ok
+test controller::tests::playback_filter_excludes_requested_event_types ... ok
+test event::tests::button_aliases_parse ... ok
+test event::tests::events_round_trip_as_tagged_json ... ok
+test keyboard::tests::hotkey_presses_in_order_and_releases_in_reverse ... ok
+test keyboard::tests::hotkey_releases_pressed_modifiers_after_backend_failure ... ok
+test keyboard::tests::key_events_round_trip ... ok
+test keyboard::tests::playback_emits_repeat_events ... ok
+test linux::tests::converts_linux_button_events ... ok
+test linux::tests::converts_linux_keyboard_events_and_repeats ... ok
+test linux::tests::ignores_unknown_linux_events ... ok
+test agent::tests::frame_source_starts_with_latest_bounded_trajectory ... ok
+test controller::tests::animated_motion_reaches_exact_destination ... ok
+
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running unittests src/main.rs (target/debug/deps/computeruse-47ad954a76633900)
+
+running 1 test
+test tests::agent_actions_are_validated_before_execution ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+[0m
+All Rust checks pass: 19 tests, Clippy, formatting, and docs. The only diff-check failures come from previously staged automation transcript files (`gui_spec.out` and `homing.out`), which are generated logs rather than project deliverables; I’m excluding those logs and their prompt files from the commit while leaving them untouched in the working directory.
+[0m$ [0mgit restore --staged "gui_spec" "gui_spec.out" "homing" "homing.out" && git add "CONTRIBUTING.md" "Cargo.lock" "Cargo.toml" "README.md" "QUICKSTART.md" "docs/MIGRATION.md" "src/agent.rs" "src/controller.rs" "src/keyboard.rs" "src/lib.rs" "src/linux.rs" "src/main.rs" && git diff --cached --check && cargo run --quiet -- agent --help && git status --short --branch && git diff --cached --stat
+Run the instruction-driven visual policy over screencast frames
+
+Usage: computeruse agent [OPTIONS] --frames <FRAMES> --instructions <INSTRUCTIONS>
+
+Options:
+      --frames <FRAMES>
+          
+      --instructions <INSTRUCTIONS>
+          
+      --model <MODEL>
+          [default: gpt-Astra]
+      --trajectory <TRAJECTORY>
+          [default: 3]
+      --max-steps <MAX_STEPS>
+          [default: 50]
+      --frame-timeout-ms <FRAME_TIMEOUT_MS>
+          [default: 10000]
+      --execute
+          Actually inject policy actions. Without this flag the agent is a dry run
+      --trace <TRACE>
+          Optional JSONL transition log for evaluation or offline learning
+  -h, --help
+          Print help
+## main...origin/main
+M  CONTRIBUTING.md
+M  Cargo.lock
+M  Cargo.toml
+A  QUICKSTART.md
+M  README.md
+M  docs/MIGRATION.md
+A  src/agent.rs
+M  src/controller.rs
+A  src/keyboard.rs
+M  src/lib.rs
+M  src/linux.rs
+M  src/main.rs
+?? gui_spec
+?? gui_spec.out
+?? homing
+?? homing.out
+?? push_spec
+?? push_spec.out
+ CONTRIBUTING.md   |    7 +-
+ Cargo.lock        | 1203 +++++++++++++++++++++++++++++++++++++++++++++++++++--
+ Cargo.toml        |    6 +-
+ QUICKSTART.md     |   57 +++
+ README.md         |   81 +++-
+ docs/MIGRATION.md |   42 +-
+ src/agent.rs      |  405 ++++++++++++++++++
+ src/controller.rs |   12 +
+ src/keyboard.rs   |  410 ++++++++++++++++++
+ src/lib.rs        |    8 +-
+ src/linux.rs      |  169 +++++++-
+ src/main.rs       |  363 +++++++++++++++-
+ 12 files changed, 2707 insertions(+), 56 deletions(-)
+[0m
+[0m# [0mTodos
+[✓] Inspect repository model usage, docs, and git state
+[✓] Refactor usage to gpt-Astra with the smallest change
+[✓] Update README.md and add simple QUICKSTART.md
+[✓] Run relevant verification
+[•] Commit and push intended changes
+[0m
+[0m$ [0mgit status --short && git diff --cached --name-status && git diff --cached -- README.md QUICKSTART.md src/agent.rs src/lib.rs src/main.rs && git log --oneline -10
+M  CONTRIBUTING.md
+M  Cargo.lock
+M  Cargo.toml
+A  QUICKSTART.md
+M  README.md
+M  docs/MIGRATION.md
+A  src/agent.rs
+M  src/controller.rs
+A  src/keyboard.rs
+M  src/lib.rs
+M  src/linux.rs
+M  src/main.rs
+?? gui_spec
+?? gui_spec.out
+?? homing
+?? homing.out
+?? push_spec
+?? push_spec.out
+M	CONTRIBUTING.md
+M	Cargo.lock
+M	Cargo.toml
+A	QUICKSTART.md
+M	README.md
+M	docs/MIGRATION.md
+A	src/agent.rs
+M	src/controller.rs
+A	src/keyboard.rs
+M	src/lib.rs
+M	src/linux.rs
+M	src/main.rs
+diff --git a/QUICKSTART.md b/QUICKSTART.md
+new file mode 100644
+index 0000000..58a6f48
+--- /dev/null
++++ b/QUICKSTART.md
+@@ -0,0 +1,57 @@
++# Quickstart
++
++`computeruse` captures and controls the mouse and keyboard on Linux. Its visual
++agent sends screencast frames and GUI instructions to gpt-Astra, then prints the
++model's proposed actions. Input is only injected when you add `--execute`.
++
++## 1. Build
++
++Install Rust 1.88 or newer, clone the repository, and run:
++
++```bash
++cargo build --release
++```
++
++The binary is available at `./target/release/computeruse`.
++
++## 2. Allow Input Access
++
++The tool needs read access to `/dev/input` and write access to `/dev/uinput`.
++For a quick local test, run it with `sudo`. For regular use, follow the safer
++group setup in the [README](README.md#requirements).
++
++## 3. Try A Command
++
++```bash
++./target/release/computeruse move 100 0
++./target/release/computeruse click left
++./target/release/computeruse hotkey 'ctrl+l'
++```
++
++## 4. Run The gpt-Astra Agent
++
++Create a directory that your screencast tool will fill with PNG, JPEG, or WebP
++frames, and write one or more GUI instructions:
++
++```bash
++mkdir -p screencast-frames
++printf '%s\n' 'Open the browser settings page.' > gui-steps.txt
++export OPENAI_API_KEY=...
++export OPENAI_BASE_URL=https://api.openai.com/v1
++```
++
++Start with dry-run mode. It prints JSON decisions but does not control input:
++
++```bash
++./target/release/computeruse agent \
++  --frames ./screencast-frames \
++  --instructions ./gui-steps.txt \
++  --trace ./trajectory.jsonl
++```
++
++The default model is `gpt-Astra`. If your compatible endpoint exposes it under
++a different name, pass `--model NAME`.
++
++After reviewing the dry-run output, add `--execute` to allow the model-selected
++mouse and keyboard actions. Keep an emergency stop method available and only
++run trusted instructions.
+diff --git a/README.md b/README.md
+index 7ecfe0a..8733e0c 100644
+--- a/README.md
++++ b/README.md
+@@ -1,9 +1,10 @@
+ # computeruse
+ 
+-`computeruse` is a Rust library and command-line tool for global mouse capture
+-and control on Ubuntu. It is a Linux-focused refactor of
+-[`boppreh/mouse`](https://github.com/boppreh/mouse) that uses the kernel's
+-`evdev` and `uinput` interfaces instead of Python and X11.
++`computeruse` is a Rust library and command-line tool for global mouse and
++keyboard capture and control on Ubuntu. It is a Linux-focused refactor of
++[`boppreh/mouse`](https://github.com/boppreh/mouse) and
++[`boppreh/keyboard`](https://github.com/boppreh/keyboard) that uses the
++kernel's `evdev` and `uinput` interfaces instead of Python and X11.
+ 
+ The kernel interfaces work in both Xorg and Wayland sessions and are suitable
+ for Ubuntu 26.04. No display-server-specific automation API is required.
+@@ -14,6 +15,9 @@ for Ubuntu 26.04. No display-server-specific automation API is required.
+ - Inject clicks, button presses, movement, scrolling, and drag operations.
+ - Move to normalized absolute coordinates through a virtual absolute pointer.
+ - Record events as portable JSON and replay them with timing and type filters.
++- Hook, record, replay, and inject keyboard keys and simultaneous hotkeys.
++- Read ordered screencast frames and retain a bounded visual state trajectory.
++- Use an OpenAI-compatible gpt-Astra vision policy to propose or execute GUI actions.
+ - Use the same functionality from the CLI or the Rust library.
+ - Test high-level behavior without access to physical input hardware.
+ 
+@@ -44,6 +48,8 @@ trusted users and services.
+ 
+ ## Install
+ 
++For a short setup walkthrough, see [`QUICKSTART.md`](QUICKSTART.md).
++
+ ```bash
+ cargo install --git https://github.com/AI10xDev/computeruse
+ ```
+@@ -73,17 +79,27 @@ computeruse move-to 32768 32768
+ # Print newline-delimited JSON events until interrupted.
+ computeruse listen
+ 
+-# Record through the first right-button press, then replay twice as fast.
++# Home the pointer to (0, 0), record through the first right-button press,
++# then home it again and replay twice as fast.
+ computeruse record session.json
+ computeruse play session.json --speed 2
+ 
+ # Replay only movement and wheel events.
+ computeruse play session.json --no-buttons
++
++# Hook, send, record, and replay keyboard events.
++computeruse keyboard-listen
++computeruse hotkey 'ctrl+shift+a'
++computeruse keyboard-record keys.json --stop-key escape
++computeruse keyboard-play keys.json --speed 2
+ ```
+ 
+-The `record` command includes the stop event in the file, matching the behavior
+-of the original Python package. Use `--stop-button middle` to select another
+-button. A speed of `0` replays events without delays.
++Before capture starts, the `record` command moves the pointer to normalized
++desktop coordinate `(0, 0)`, making that position the origin for the recorded
++relative movement. The `play` command returns the pointer to the same origin
++before replaying events. Recordings include the stop event in the file,
++matching the behavior of the original Python package. Use `--stop-button
++middle` to select another button. A speed of `0` replays events without delays.
+ 
+ ## Library
+ 
+@@ -112,6 +128,55 @@ fn main() -> std::io::Result<()> {
+ `Controller<B>` is generic over `MouseBackend`, allowing applications to use a
+ fake backend in unit tests without opening `/dev/uinput`.
+ 
++`KeyboardController<B>` provides the equivalent keyboard abstraction. Key
++recordings retain the Linux scan code, normalized key name, up/down state,
++repeat marker, and timestamp. Hotkeys press keys in the listed order and
++release them in reverse order, matching `boppreh/keyboard` behavior.
++
++## Visual Agent
++
++The `agent` command watches a screencast frame directory and evaluates GUI
++instructions from a text file. PNG, JPEG, and WebP files are ordered by
++modification time. Each policy call receives the latest bounded frame
++trajectory and prior transitions, then emits typed mouse, keyboard, scroll, or
++wait actions. The transition log includes the policy's progress estimate and
++its change as a reward signal for evaluation or offline reinforcement learning.
++Frame producers should write to a temporary name and atomically rename the
++finished image into the watched directory. Rewritten paths are detected from
++their size and modification time, and reads that change while in progress are
++deferred.
++
++Set an API key and optionally an OpenAI-compatible endpoint:
++
++```bash
++export OPENAI_API_KEY=...
++export OPENAI_BASE_URL=https://api.openai.com/v1
++
++# Safe default: inspect decisions as JSONL without injecting input.
++computeruse agent \
++  --frames ./screencast-frames \
++  --instructions ./gui-steps.txt \
++  --trace ./trajectory.jsonl
++
++# Explicitly allow model-selected mouse and keyboard input.
++computeruse agent \
++  --frames ./screencast-frames \
++  --instructions ./gui-steps.txt \
++  --execute
++```
++
++The default model is `gpt-Astra`; override it with `--model` for the name
++exposed by your endpoint. On the first step the source uses only the newest
++trajectory window, so stale frames are not replayed. After an action it waits
++for a new frame. `--execute` is deliberately required for input injection.
++Policy actions are atomic key taps/hotkeys and mouse clicks rather than
++persistent holds. Each decision is limited to 16 actions, relative movement to
++32767 units per axis, scrolling to 100 units, and waits to 30 seconds.
++
++This is an online visual policy/evaluation loop, not an in-process model
++trainer. The `Policy` trait and JSONL transitions are the integration points
++for a separate RL trainer or replay buffer.
++
+ ## Wayland And Coordinates
+ 
+ Wayland intentionally does not expose a global pointer-position query. This
+diff --git a/src/agent.rs b/src/agent.rs
+new file mode 100644
+index 0000000..44d08df
+--- /dev/null
++++ b/src/agent.rs
+@@ -0,0 +1,405 @@
++use anyhow::{Context, Result, bail};
++use base64::Engine;
++use reqwest::blocking::Client;
++use serde::{Deserialize, Serialize};
++use serde_json::{Value, json};
++use std::collections::{HashMap, VecDeque};
++use std::fs::{self, File};
++use std::io::Read;
++use std::path::{Path, PathBuf};
++use std::thread;
++use std::time::{Duration, Instant};
++
++const MAX_FRAME_BYTES: u64 = 20 * 1024 * 1024;
++
++#[derive(Clone, Debug)]
++pub struct Frame {
++    pub path: PathBuf,
++    pub media_type: &'static str,
++    pub bytes: Vec<u8>,
++}
++
++impl Frame {
++    fn data_url(&self) -> String {
++        format!(
++            "data:{};base64,{}",
++            self.media_type,
++            base64::engine::general_purpose::STANDARD.encode(&self.bytes)
++        )
++    }
++}
++
++pub struct FrameSource {
++    directory: PathBuf,
++    seen: HashMap<PathBuf, FrameIdentity>,
++    trajectory: VecDeque<Frame>,
++    trajectory_len: usize,
++}
++
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++struct FrameIdentity {
++    len: u64,
++    modified: Option<std::time::SystemTime>,
++}
++
++impl FrameSource {
++    pub fn new(directory: impl Into<PathBuf>, trajectory_len: usize) -> Result<Self> {
++        let directory = directory.into();
++        if !directory.is_dir() {
++            bail!("frame directory does not exist: {}", directory.display());
++        }
++        if trajectory_len == 0 {
++            bail!("trajectory length must be greater than zero");
++        }
++        Ok(Self {
++            directory,
++            seen: HashMap::new(),
++            trajectory: VecDeque::new(),
++            trajectory_len,
++        })
++    }
++
++    pub fn next(&mut self, timeout: Duration) -> Result<Option<&VecDeque<Frame>>> {
++        let deadline = Instant::now() + timeout;
++        loop {
++            let paths = self.unseen_paths()?;
++            if !paths.is_empty() {
++                let keep_from = paths.len().saturating_sub(self.trajectory_len);
++                for (path, identity) in &paths[..keep_from] {
++                    self.seen.insert(path.clone(), *identity);
++                }
++                let mut loaded = false;
++                for (path, identity) in paths.into_iter().skip(keep_from) {
++                    match read_stable_frame(&path, identity)? {
++                        Some(frame) => {
++                            self.seen.insert(path, identity);
++                            self.trajectory.push_back(frame);
++                            loaded = true;
++                        }
++                        None => continue,
++                    }
++                }
++                if loaded {
++                    while self.trajectory.len() > self.trajectory_len {
++                        self.trajectory.pop_front();
++                    }
++                    return Ok(Some(&self.trajectory));
++                }
++            }
++            if Instant::now() >= deadline {
++                return Ok(None);
++            }
++            thread::sleep(Duration::from_millis(100));
++        }
++    }
++
++    fn unseen_paths(&self) -> Result<Vec<(PathBuf, FrameIdentity)>> {
++        let mut paths = fs::read_dir(&self.directory)?
++            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
++            .filter_map(|path| {
++                let metadata = fs::metadata(&path).ok()?;
++                let identity = FrameIdentity {
++                    len: metadata.len(),
++                    modified: metadata.modified().ok(),
++                };
++                (media_type(&path).is_some() && self.seen.get(&path) != Some(&identity))
++                    .then_some((path, identity))
++            })
++            .collect::<Vec<_>>();
++        paths.sort_by_cached_key(|(path, identity)| (identity.modified, path.clone()));
++        Ok(paths)
++    }
++}
++
++fn read_stable_frame(path: &Path, identity: FrameIdentity) -> Result<Option<Frame>> {
++    if identity.len > MAX_FRAME_BYTES {
++        bail!(
++            "frame exceeds {} MiB limit: {}",
++            MAX_FRAME_BYTES / 1024 / 1024,
++            path.display()
++        );
++    }
++    let mut bytes = Vec::with_capacity(identity.len as usize);
++    File::open(path)
++        .with_context(|| format!("cannot open frame {}", path.display()))?
++        .take(MAX_FRAME_BYTES + 1)
++        .read_to_end(&mut bytes)
++        .with_context(|| format!("cannot read frame {}", path.display()))?;
++    if bytes.len() as u64 > MAX_FRAME_BYTES {
++        bail!(
++            "frame exceeds {} MiB limit: {}",
++            MAX_FRAME_BYTES / 1024 / 1024,
++            path.display()
++        );
++    }
++    let metadata = fs::metadata(path)?;
++    let after = FrameIdentity {
++        len: metadata.len(),
++        modified: metadata.modified().ok(),
++    };
++    let media_type = media_type(path).expect("path was filtered by media type");
++    if identity != after
++        || bytes.len() as u64 != after.len
++        || !is_complete_image(&bytes, media_type)
++    {
++        return Ok(None);
++    }
++    Ok(Some(Frame {
++        bytes,
++        path: path.to_path_buf(),
++        media_type,
++    }))
++}
++
++fn is_complete_image(bytes: &[u8], media_type: &str) -> bool {
++    match media_type {
++        "image/png" => {
++            bytes.starts_with(b"\x89PNG\r\n\x1a\n")
++                && bytes.len() >= 20
++                && &bytes[bytes.len() - 12..bytes.len() - 4] == b"\0\0\0\0IEND"
++        }
++        "image/jpeg" => bytes.starts_with(b"\xff\xd8") && bytes.ends_with(b"\xff\xd9"),
++        "image/webp" => {
++            bytes.len() >= 12
++                && bytes.starts_with(b"RIFF")
++                && &bytes[8..12] == b"WEBP"
++                && u32::from_le_bytes(bytes[4..8].try_into().expect("four-byte slice")) as usize + 8
++                    == bytes.len()
++        }
++        _ => false,
++    }
++}
++
++fn media_type(path: &Path) -> Option<&'static str> {
++    match path.extension()?.to_str()?.to_ascii_lowercase().as_str() {
++        "png" => Some("image/png"),
++        "jpg" | "jpeg" => Some("image/jpeg"),
++        "webp" => Some("image/webp"),
++        _ => None,
++    }
++}
++
++#[derive(Clone, Debug, Deserialize, Serialize)]
++#[serde(tag = "type", rename_all = "snake_case")]
++pub enum Action {
++    MouseMove { dx: i32, dy: i32 },
++    MouseMoveTo { x: u16, y: u16 },
++    MouseClick { button: crate::Button },
++    Scroll { delta: i32, horizontal: bool },
++    KeyTap { key: String },
++    Hotkey { keys: String },
++    Wait { milliseconds: u64 },
++}
++
++#[derive(Clone, Debug, Deserialize, Serialize)]
++pub struct AgentDecision {
++    #[serde(default)]
++    pub rationale: String,
++    #[serde(default)]
++    pub actions: Vec<Action>,
++    #[serde(default)]
++    pub completed: bool,
++    #[serde(default)]
++    pub progress: f32,
++}
++
++#[derive(Clone, Debug, Serialize)]
++pub struct Transition {
++    pub step: usize,
++    pub frame: PathBuf,
++    pub actions: Vec<Action>,
++    pub progress: f32,
++    pub reward: f32,
++    pub completed: bool,
++    pub executed: bool,
++}
++
++pub trait Policy {
++    fn decide(
++        &self,
++        instructions: &str,
++        trajectory: &VecDeque<Frame>,
++        transitions: &[Transition],
++    ) -> Result<AgentDecision>;
++}
++
++pub struct GptAstraPolicy {
++    client: Client,
++    endpoint: String,
++    api_key: String,
++    model: String,
++}
++
++impl GptAstraPolicy {
++    pub fn from_env(model: impl Into<String>) -> Result<Self> {
++        let api_key = std::env::var("OPENAI_API_KEY")
++            .context("OPENAI_API_KEY is required for the agent command")?;
++        let base_url =
++            std::env::var("OPENAI_BASE_URL").unwrap_or_else(|_| "https://api.openai.com/v1".into());
++        Ok(Self {
++            client: Client::builder()
++                .timeout(Duration::from_secs(120))
++                .build()?,
++            endpoint: format!("{}/chat/completions", base_url.trim_end_matches('/')),
++            api_key,
++            model: model.into(),
++        })
++    }
++}
++
++impl Policy for GptAstraPolicy {
++    fn decide(
++        &self,
++        instructions: &str,
++        trajectory: &VecDeque<Frame>,
++        transitions: &[Transition],
++    ) -> Result<AgentDecision> {
++        let mut content = vec![json!({
++            "type": "text",
++            "text": format!(
++                "GUI instructions:\n{instructions}\n\nPrevious transitions:\n{}",
++                serde_json::to_string(transitions)?
++            )
++        })];
++        for (index, frame) in trajectory.iter().enumerate() {
++            content.push(json!({
++                "type": "text",
++                "text": format!("Trajectory frame {index}: {}", frame.path.display())
++            }));
++            content.push(json!({
++                "type": "image_url",
++                "image_url": { "url": frame.data_url(), "detail": "high" }
++            }));
++        }
++        let body = json!({
++            "model": self.model,
++            "messages": [
++                {
++                    "role": "system",
++                    "content": "Act as a cautious GUI policy. Infer state changes from the ordered frames and return JSON only. Use normalized 0..65535 coordinates for mouse_move_to. Prefer one small, reversible action per observation. Never invent an action type. Set completed only when the latest frame visibly proves the instructions are complete. Output: {\"rationale\":string,\"actions\":[action],\"completed\":bool,\"progress\":number}. Action types: mouse_move(dx,dy), mouse_move_to(x,y), mouse_click(button), scroll(delta,horizontal), key_tap(key), hotkey(keys), wait(milliseconds). Buttons: left, right, middle, side, extra. Named keys and hotkeys use forms such as enter, tab, escape, ctrl+shift+a. Relative movement is limited to +/-32767, scrolling to +/-100, and waits to 30000 milliseconds."
++                },
++                { "role": "user", "content": content }
++            ],
++            "response_format": { "type": "json_object" },
++            "temperature": 0.1
++        });
++        let response = self
++            .client
++            .post(&self.endpoint)
++            .bearer_auth(&self.api_key)
++            .json(&body)
++            .send()
++            .context("gpt-Astra policy request failed")?;
++        let status = response.status();
++        let value: Value = response.json().context("policy response was not JSON")?;
++        if !status.is_success() {
++            bail!("policy request returned {status}: {value}");
++        }
++        let content = value
++            .pointer("/choices/0/message/content")
++            .and_then(Value::as_str)
++            .context("policy response did not contain choices[0].message.content")?;
++        let decision: AgentDecision = parse_decision(content)
++            .with_context(|| format!("policy returned an invalid decision: {content}"))?;
++        if !(0.0..=1.0).contains(&decision.progress) {
++            bail!("policy progress must be between 0 and 1");
++        }
++        Ok(decision)
++    }
++}
++
++fn parse_decision(content: &str) -> Result<AgentDecision, serde_json::Error> {
++    let trimmed = content.trim();
++    let json = if trimmed.starts_with("```") {
++        let without_opening = trimmed
++            .strip_prefix("```json")
++            .or_else(|| trimmed.strip_prefix("```JSON"))
++            .or_else(|| trimmed.strip_prefix("```"))
++            .unwrap_or(trimmed);
++        without_opening
++            .strip_suffix("```")
++            .unwrap_or(without_opening)
++            .trim()
++    } else {
++        trimmed
++    };
++    serde_json::from_str(json)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use std::time::{SystemTime, UNIX_EPOCH};
++
++    #[test]
++    fn action_protocol_round_trips() {
++        let decision = AgentDecision {
++            rationale: "focus the field".into(),
++            actions: vec![Action::Hotkey {
++                keys: "ctrl+l".into(),
++            }],
++            completed: false,
++            progress: 0.25,
++        };
++        let json = serde_json::to_string(&decision).unwrap();
++        let parsed: AgentDecision = serde_json::from_str(&json).unwrap();
++        assert!(matches!(parsed.actions[0], Action::Hotkey { .. }));
++    }
++
++    #[test]
++    fn recognizes_supported_frame_types() {
++        assert_eq!(media_type(Path::new("frame.PNG")), Some("image/png"));
++        assert_eq!(media_type(Path::new("notes.txt")), None);
++    }
++
++    #[test]
++    fn accepts_fenced_policy_json() {
++        let decision =
++            parse_decision("```json\n{\"actions\":[],\"completed\":true,\"progress\":1.0}\n```")
++                .unwrap();
++        assert!(decision.completed);
++    }
++
++    #[test]
++    fn frame_source_starts_with_latest_bounded_trajectory() {
++        let suffix = SystemTime::now()
++            .duration_since(UNIX_EPOCH)
++            .unwrap()
++            .as_nanos();
++        let directory = std::env::temp_dir().join(format!("computeruse-frames-{suffix}"));
++        fs::create_dir(&directory).unwrap();
++        for name in ["001.png", "002.png", "003.png"] {
++            fs::write(directory.join(name), fake_png(name.as_bytes()[0])).unwrap();
++            thread::sleep(Duration::from_millis(2));
++        }
++
++        let mut source = FrameSource::new(&directory, 2).unwrap();
++        let trajectory = source.next(Duration::ZERO).unwrap().unwrap();
++        assert_eq!(trajectory.len(), 2);
++        assert!(trajectory[0].path.ends_with("002.png"));
++        assert!(trajectory[1].path.ends_with("003.png"));
++        assert!(source.next(Duration::ZERO).unwrap().is_none());
++
++        thread::sleep(Duration::from_millis(2));
++        let changed = fake_png(b'x');
++        fs::write(directory.join("003.png"), &changed).unwrap();
++        let trajectory = source.next(Duration::ZERO).unwrap().unwrap();
++        assert_eq!(trajectory.back().unwrap().bytes, changed);
++
++        fs::remove_dir_all(directory).unwrap();
++    }
++
++    #[test]
++    fn rejects_incomplete_image_containers() {
++        assert!(!is_complete_image(b"\x89PNG\r\n\x1a\npartial", "image/png"));
++        assert!(!is_complete_image(b"\xff\xd8partial", "image/jpeg"));
++        assert!(!is_complete_image(b"RIFF\x10\0\0\0WEBP", "image/webp"));
++    }
++
++    fn fake_png(marker: u8) -> Vec<u8> {
++        let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
++        bytes.extend([marker; 4]);
++        bytes.extend(b"\0\0\0\0IEND\0\0\0\0");
++        bytes
++    }
++}
+diff --git a/src/lib.rs b/src/lib.rs
+index 12a685d..046da43 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -3,14 +3,20 @@
+ //! The Linux implementation uses the kernel `evdev` and `uinput` interfaces,
+ //! so it does not depend on X11 and works with both Xorg and Wayland sessions.
+ 
++mod agent;
+ mod controller;
+ mod event;
++mod keyboard;
+ 
+ #[cfg(target_os = "linux")]
+ mod linux;
+ 
++pub use agent::{Action, AgentDecision, Frame, FrameSource, GptAstraPolicy, Policy, Transition};
+ pub use controller::{Controller, MouseBackend, PlaybackFilter};
+ pub use event::{Button, ButtonState, MouseEvent};
++pub use keyboard::{
++    Key, KeyState, KeyboardBackend, KeyboardController, KeyboardEvent, KeyboardPlaybackFilter,
++};
+ 
+ #[cfg(target_os = "linux")]
+-pub use linux::{LinuxMouse, Listener};
++pub use linux::{KeyboardListener, LinuxKeyboard, LinuxMouse, Listener};
+diff --git a/src/main.rs b/src/main.rs
+index 3bf9660..0893955 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -1,9 +1,15 @@
+ use anyhow::{Context, Result, bail};
+ use clap::{Parser, Subcommand};
+-use computeruse::{Button, Controller, LinuxMouse, Listener, MouseEvent, PlaybackFilter};
+-use std::fs::File;
+-use std::io::{BufReader, BufWriter};
++use computeruse::{
++    Action, Button, Controller, FrameSource, GptAstraPolicy, Key, KeyState, KeyboardController,
++    KeyboardEvent, KeyboardListener, KeyboardPlaybackFilter, LinuxKeyboard, LinuxMouse, Listener,
++    MouseEvent, PlaybackFilter, Policy, Transition,
++};
++use serde::Serialize;
++use std::fs::{self, File, OpenOptions};
++use std::io::{BufReader, BufWriter, Write};
+ use std::path::PathBuf;
++use std::thread;
+ use std::time::Duration;
+ 
+ #[derive(Parser)]
+@@ -63,6 +69,52 @@ enum Command {
+         #[arg(long)]
+         no_wheel: bool,
+     },
++    KeyPress {
++        key: Key,
++    },
++    KeyRelease {
++        key: Key,
++    },
++    Hotkey {
++        /// Simultaneous keys, for example `ctrl+shift+a`.
++        keys: String,
++    },
++    KeyboardListen,
++    KeyboardRecord {
++        output: PathBuf,
++        #[arg(long, default_value = "escape")]
++        stop_key: Key,
++    },
++    KeyboardPlay {
++        input: PathBuf,
++        #[arg(long, default_value_t = 1.0)]
++        speed: f64,
++        #[arg(long)]
++        no_press: bool,
++        #[arg(long)]
++        no_release: bool,
++    },
++    /// Run the instruction-driven visual policy over screencast frames.
++    Agent {
++        #[arg(long)]
++        frames: PathBuf,
++        #[arg(long)]
++        instructions: PathBuf,
++        #[arg(long, default_value = "gpt-Astra")]
++        model: String,
++        #[arg(long, default_value_t = 3)]
++        trajectory: usize,
++        #[arg(long, default_value_t = 50)]
++        max_steps: usize,
++        #[arg(long, default_value_t = 10_000)]
++        frame_timeout_ms: u64,
++        /// Actually inject policy actions. Without this flag the agent is a dry run.
++        #[arg(long)]
++        execute: bool,
++        /// Optional JSONL transition log for evaluation or offline learning.
++        #[arg(long)]
++        trace: Option<PathBuf>,
++    },
+ }
+ 
+ fn main() -> Result<()> {
+@@ -75,6 +127,30 @@ fn main() -> Result<()> {
+             output,
+             stop_button,
+         } => record(output, stop_button),
++        Command::KeyboardListen => {
++            KeyboardListener::new()?.listen(|event| println_json(&event))?;
++            Ok(())
++        }
++        Command::KeyboardRecord { output, stop_key } => keyboard_record(output, stop_key),
++        Command::Agent {
++            frames,
++            instructions,
++            model,
++            trajectory,
++            max_steps,
++            frame_timeout_ms,
++            execute,
++            trace,
++        } => run_agent(AgentOptions {
++            frames,
++            instructions,
++            model,
++            trajectory,
++            max_steps,
++            frame_timeout: Duration::from_millis(frame_timeout_ms),
++            execute,
++            trace,
++        }),
+         command => control(command),
+     }
+ }
+@@ -119,6 +195,9 @@ fn control(command: Command) -> Result<()> {
+                     .with_context(|| format!("cannot open recording at {}", input.display()))?,
+             );
+             let events: Vec<MouseEvent> = serde_json::from_reader(reader)?;
++            mouse
++                .home()
++                .context("cannot move mouse to the home position before playback")?;
+             mouse.play(
+                 &events,
+                 speed,
+@@ -129,13 +208,252 @@ fn control(command: Command) -> Result<()> {
+                 },
+             )?;
+         }
+-        Command::Listen | Command::Record { .. } => unreachable!(),
++        Command::KeyPress { key } => KeyboardController::new(
++            LinuxKeyboard::new()
++                .context("cannot create virtual keyboard; check /dev/uinput permissions")?,
++        )
++        .press(&key)?,
++        Command::KeyRelease { key } => KeyboardController::new(
++            LinuxKeyboard::new()
++                .context("cannot create virtual keyboard; check /dev/uinput permissions")?,
++        )
++        .release(&key)?,
++        Command::Hotkey { keys } => KeyboardController::new(
++            LinuxKeyboard::new()
++                .context("cannot create virtual keyboard; check /dev/uinput permissions")?,
++        )
++        .send_hotkey(&keys)
++        .map_err(anyhow::Error::msg)?,
++        Command::KeyboardPlay {
++            input,
++            speed,
++            no_press,
++            no_release,
++        } => {
++            if speed < 0.0 {
++                bail!("speed must be zero or greater");
++            }
++            let reader = BufReader::new(
++                File::open(&input)
++                    .with_context(|| format!("cannot open recording at {}", input.display()))?,
++            );
++            let events: Vec<KeyboardEvent> = serde_json::from_reader(reader)?;
++            KeyboardController::new(
++                LinuxKeyboard::new()
++                    .context("cannot create virtual keyboard; check /dev/uinput permissions")?,
++            )
++            .play(
++                &events,
++                speed,
++                KeyboardPlaybackFilter {
++                    press: !no_press,
++                    release: !no_release,
++                },
++            )?;
++        }
++        Command::Listen
++        | Command::Record { .. }
++        | Command::KeyboardListen
++        | Command::KeyboardRecord { .. }
++        | Command::Agent { .. } => unreachable!(),
++    }
++    Ok(())
++}
++
++fn keyboard_record(output: PathBuf, stop_key: Key) -> Result<()> {
++    let mut listener = KeyboardListener::new()?;
++    let mut events = Vec::new();
++    let mut stop_pressed = false;
++    listener.listen_until(|event| {
++        if event.key.scan_code == stop_key.scan_code
++            && event.state == KeyState::Down
++            && !event.repeat
++        {
++            stop_pressed = true;
++        }
++        let stopped = stop_pressed
++            && event.key.scan_code == stop_key.scan_code
++            && event.state == KeyState::Up;
++        events.push(event);
++        stopped
++    })?;
++    events.sort_by(|left, right| left.time.total_cmp(&right.time));
++    let file = File::create(&output)
++        .with_context(|| format!("cannot create recording at {}", output.display()))?;
++    serde_json::to_writer_pretty(BufWriter::new(file), &events)?;
++    Ok(())
++}
++
++struct AgentOptions {
++    frames: PathBuf,
++    instructions: PathBuf,
++    model: String,
++    trajectory: usize,
++    max_steps: usize,
++    frame_timeout: Duration,
++    execute: bool,
++    trace: Option<PathBuf>,
++}
++
++fn run_agent(options: AgentOptions) -> Result<()> {
++    let instructions = fs::read_to_string(&options.instructions).with_context(|| {
++        format!(
++            "cannot read GUI instructions at {}",
++            options.instructions.display()
++        )
++    })?;
++    let mut frames = FrameSource::new(options.frames, options.trajectory)?;
++    let policy = GptAstraPolicy::from_env(options.model)?;
++    let mut transitions = Vec::new();
++    let mut previous_progress = 0.0;
++    let mut devices = if options.execute {
++        Some((
++            Controller::new(
++                LinuxMouse::new()
++                    .context("cannot create virtual mouse; check /dev/uinput permissions")?,
++            ),
++            KeyboardController::new(
++                LinuxKeyboard::new()
++                    .context("cannot create virtual keyboard; check /dev/uinput permissions")?,
++            ),
++        ))
++    } else {
++        None
++    };
++
++    for step in 0..options.max_steps {
++        let trajectory = frames
++            .next(options.frame_timeout)?
++            .with_context(|| format!("timed out waiting for a new frame at step {step}"))?;
++        let frame = trajectory
++            .back()
++            .expect("trajectory has a new frame")
++            .path
++            .clone();
++        let decision = policy.decide(&instructions, trajectory, &transitions)?;
++        if decision.actions.len() > 16 {
++            bail!("policy proposed more than 16 actions in one step");
++        }
++        validate_actions(&decision.actions)?;
++        if let Some((mouse, keyboard)) = &mut devices {
++            execute_actions(mouse, keyboard, &decision.actions)?;
++        }
++        let progress = decision.progress.clamp(0.0, 1.0);
++        let transition = Transition {
++            step,
++            frame,
++            actions: decision.actions,
++            progress,
++            reward: progress - previous_progress,
++            completed: decision.completed,
++            executed: options.execute,
++        };
++        previous_progress = progress;
++        println_json(&transition);
++        if let Some(path) = &options.trace {
++            append_json_line(path, &transition)?;
++        }
++        let completed = transition.completed;
++        transitions.push(transition);
++        if completed {
++            return Ok(());
++        }
++    }
++    bail!("agent reached max steps without completing the instructions")
++}
++
++fn execute_actions(
++    mouse: &mut Controller<LinuxMouse>,
++    keyboard: &mut KeyboardController<LinuxKeyboard>,
++    actions: &[Action],
++) -> Result<()> {
++    for action in actions {
++        match action {
++            Action::MouseMove { dx, dy } => mouse.move_relative(*dx, *dy)?,
++            Action::MouseMoveTo { x, y } => mouse.move_absolute(*x, *y)?,
++            Action::MouseClick { button } => mouse.click(*button)?,
++            Action::Scroll { delta, horizontal } if *horizontal => {
++                mouse.horizontal_wheel(*delta)?
++            }
++            Action::Scroll { delta, .. } => mouse.wheel(*delta)?,
++            Action::KeyTap { key } => keyboard.send_hotkey(key).map_err(anyhow::Error::msg)?,
++            Action::Hotkey { keys } => keyboard.send_hotkey(keys).map_err(anyhow::Error::msg)?,
++            Action::Wait { milliseconds } => {
++                if *milliseconds > 30_000 {
++                    bail!("policy wait action exceeds 30 seconds");
++                }
++                thread::sleep(Duration::from_millis(*milliseconds));
++            }
++        }
++    }
++    Ok(())
++}
++
++fn validate_actions(actions: &[Action]) -> Result<()> {
++    for action in actions {
++        match action {
++            Action::MouseMove { dx, dy }
++                if dx.unsigned_abs() > 32_767 || dy.unsigned_abs() > 32_767 =>
++            {
++                bail!("policy relative mouse movement exceeds +/-32767")
++            }
++            Action::Scroll { delta, .. } if delta.unsigned_abs() > 100 => {
++                bail!("policy scroll action exceeds +/-100")
++            }
++            Action::KeyTap { key } => {
++                validate_policy_key(key)?;
++            }
++            Action::Hotkey { keys } => {
++                let parsed = keys
++                    .split('+')
++                    .map(str::parse::<Key>)
++                    .collect::<Result<Vec<_>, _>>()
++                    .map_err(anyhow::Error::msg)?;
++                if parsed.is_empty() {
++                    bail!("policy hotkey cannot be empty");
++                }
++                if let Some(key) = parsed
++                    .iter()
++                    .find(|key| !LinuxKeyboard::supports_scan_code(key.scan_code))
++                {
++                    bail!("policy key is not injectable on Linux: {key}");
++                }
++            }
++            Action::Wait { milliseconds } if *milliseconds > 30_000 => {
++                bail!("policy wait action exceeds 30 seconds")
++            }
++            _ => {}
++        }
++    }
++    Ok(())
++}
++
++fn validate_policy_key(value: &str) -> Result<Key> {
++    let key = value.parse::<Key>().map_err(anyhow::Error::msg)?;
++    if !LinuxKeyboard::supports_scan_code(key.scan_code) {
++        bail!("policy key is not injectable on Linux: {key}");
+     }
++    Ok(key)
++}
++
++fn append_json_line(path: &PathBuf, value: &impl Serialize) -> Result<()> {
++    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
++    serde_json::to_writer(&mut file, value)?;
++    file.write_all(b"\n")?;
+     Ok(())
+ }
+ 
+ fn record(output: PathBuf, stop_button: Button) -> Result<()> {
++    // Open physical devices before creating uinput devices so recording cannot
++    // include events from the virtual mouse used for homing.
+     let mut listener = Listener::new()?;
++    let mut mouse = Controller::new(
++        LinuxMouse::new().context("cannot create uinput device; check /dev/uinput permissions")?,
++    );
++    mouse
++        .home()
++        .context("cannot move mouse to the home position before recording")?;
++
+     let mut events = Vec::new();
+     listener.listen_until(|event| {
+         let stopped = matches!(
+@@ -155,9 +473,44 @@ fn record(output: PathBuf, stop_button: Button) -> Result<()> {
+     Ok(())
+ }
+ 
+-fn println_json(event: &MouseEvent) {
++fn println_json(event: &impl Serialize) {
+     println!(
+         "{}",
+         serde_json::to_string(event).expect("event is serializable")
+     );
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn agent_actions_are_validated_before_execution() {
++        assert!(validate_actions(&[Action::MouseMove { dx: 32_768, dy: 0 }]).is_err());
++        assert!(
++            validate_actions(&[Action::Wait {
++                milliseconds: 30_001,
++            }])
++            .is_err()
++        );
++        assert!(
++            validate_actions(&[Action::KeyTap {
++                key: "code:65535".into(),
++            }])
++            .is_err()
++        );
++        assert!(
++            validate_actions(&[
++                Action::MouseMove { dx: -32_767, dy: 1 },
++                Action::Scroll {
++                    delta: 100,
++                    horizontal: false,
++                },
++                Action::Hotkey {
++                    keys: "ctrl+a".into(),
++                },
++            ])
++            .is_ok()
++        );
++    }
++}
+da149c0 Update CI checkout action
+c26a81f Initial Rust mouse automation implementation
+[0m
+[0m✱ [0mGrep "(?i)(api[_-]?key|secret|token|password)\s*[:=]\s*['\"][^.'\"\s][^'\"\s]*"[90m in . · 0 matches[0m
+The staged commit contains the completed keyboard/screencast visual-agent work plus the gpt-Astra refactor and documentation, with no credentials or generated transcripts. I’m committing it as one coherent feature update, then pushing `main` to `origin`.
+[0m
+[0m$ [0mgit commit -m "Add gpt-Astra visual agent support" && git push origin main
+[main 6d55eb5] Add gpt-Astra visual agent support
+ Committer: Ubuntu <opencode@opencode-dev-aue.hdtbi1vzctzuxap5fhmifhmete.px.internal.cloudapp.net>
+Your name and email address were configured automatically based
+on your username and hostname. Please check that they are accurate.
+You can suppress this message by setting them explicitly:
+
+    git config --global user.name "Your Name"
+    git config --global user.email you@example.com
+
+After doing this, you may fix the identity used for this commit with:
+
+    git commit --amend --reset-author
+
+ 12 files changed, 2707 insertions(+), 56 deletions(-)
+ create mode 100644 QUICKSTART.md
+ create mode 100644 src/agent.rs
+ create mode 100644 src/keyboard.rs
+To https://github.com/AI10xDev/computeruse/
+   da149c0..6d55eb5  main -> main
+[0m
+[0m$ [0mgit status --short --branch && git log -1 --oneline --decorate && git rev-list --left-right --count origin/main...main
+## main...origin/main
+?? gui_spec
+?? gui_spec.out
+?? homing
+?? homing.out
+?? push_spec
+?? push_spec.out
+6d55eb5 (HEAD -> main, origin/main, origin/HEAD) Add gpt-Astra visual agent support
+0	0
+[0m
+[0m✱ [0mGrep "gpt-Astra"[90m in . · 7 matches[0m
+[0m
+[0m# [0mTodos
+[✓] Inspect repository model usage, docs, and git state
+[✓] Refactor usage to gpt-Astra with the smallest change
+[✓] Update README.md and add simple QUICKSTART.md
+[✓] Run relevant verification
+[✓] Commit and push intended changes
+[0m
+Implemented and pushed the gpt-Astra update.
+
+- Renamed the policy to `GptAstraPolicy`.
+- Changed the default model to `gpt-Astra`.
+- Updated `README.md`.
+- Added a simple `QUICKSTART.md`.
+- Verified formatting, Clippy, docs, and all 19 tests.
+- Commit: `6d55eb5 Add gpt-Astra visual agent support`
+- Pushed successfully to `origin/main`.
+
+Generated spec and transcript files remain untracked and were not committed.

@@ -1,0 +1,1262 @@
+nohup: ignoring input
+Using spec: /home/opencode/computeruse/gui_spec
+[0m
+> build · gpt-5.6-sol
+[0m
+I’ll first map the existing capture/input architecture and project language boundaries, then identify where the Rust refactor, screencast frame ingestion, and instruction-driven control loop should fit. I’ll preserve the current interfaces where they have concrete consumers and verify each stage independently.
+[0m# [0mTodos
+[•] Inspect repository architecture, current keyboard/mouse hooks, screencast handling, and instruction formats
+[ ] Refactor the required input event layer to Rust using boppreh/keyboard-compatible behavior
+[ ] Implement screencast frame reading and state trajectory preparation from the specified directory
+[ ] Integrate an instruction-driven GPT-Sol reinforcement/control loop for keyboard and mouse actions
+[ ] Add tests/documentation and run end-to-end verification
+[0m
+[0m✱ [0mGlob "*"[90m in . · 100 matches[0m
+[0m✱ [0mGlob "**/*.{py,rs,toml,json,jsonc,md,yml,yaml,txt}"[90m in . · 9 matches[0m
+[0m✱ [0mGrep "keyboard|mouse|screencast|frame|reinforcement|trajectory|instruction|OpenAI|GPT|boppreh"[90m in . · 33 matches[0m
+[0m
+[0m$ [0mgit status --short && git log --oneline -10
+M README.md
+ M src/controller.rs
+ M src/main.rs
+?? gui_spec
+?? gui_spec.out
+?? homing
+?? homing.out
+da149c0 Update CI checkout action
+c26a81f Initial Rust mouse automation implementation
+[0m
+[0m→ [0mRead Cargo.toml
+[0m→ [0mRead homing
+[0m→ [0mRead gui_spec
+[0m→ [0mRead README.md
+[0m→ [0mRead src/lib.rs
+[0m→ [0mRead src/event.rs
+[0m→ [0mRead src/controller.rs
+[0m→ [0mRead src/linux.rs
+[0m→ [0mRead src/main.rs
+[0m
+[0m$ [0mgit diff -- README.md src/controller.rs src/main.rs
+diff --git a/README.md b/README.md
+index 7ecfe0a..74313e6 100644
+--- a/README.md
++++ b/README.md
+@@ -73,7 +73,8 @@ computeruse move-to 32768 32768
+ # Print newline-delimited JSON events until interrupted.
+ computeruse listen
+ 
+-# Record through the first right-button press, then replay twice as fast.
++# Home the pointer to (0, 0), record through the first right-button press,
++# then home it again and replay twice as fast.
+ computeruse record session.json
+ computeruse play session.json --speed 2
+ 
+@@ -81,9 +82,12 @@ computeruse play session.json --speed 2
+ computeruse play session.json --no-buttons
+ ```
+ 
+-The `record` command includes the stop event in the file, matching the behavior
+-of the original Python package. Use `--stop-button middle` to select another
+-button. A speed of `0` replays events without delays.
++Before capture starts, the `record` command moves the pointer to normalized
++desktop coordinate `(0, 0)`, making that position the origin for the recorded
++relative movement. The `play` command returns the pointer to the same origin
++before replaying events. Recordings include the stop event in the file,
++matching the behavior of the original Python package. Use `--stop-button
++middle` to select another button. A speed of `0` replays events without delays.
+ 
+ ## Library
+ 
+diff --git a/src/controller.rs b/src/controller.rs
+index a81200b..60e6850 100644
+--- a/src/controller.rs
++++ b/src/controller.rs
+@@ -47,6 +47,11 @@ impl<B: MouseBackend> Controller<B> {
+         self.backend.move_absolute(x, y)
+     }
+ 
++    /// Moves to the normalized desktop origin at the upper-left corner.
++    pub fn home(&mut self) -> Result<(), B::Error> {
++        self.move_absolute(0, 0)
++    }
++
+     pub fn wheel(&mut self, delta: i32) -> Result<(), B::Error> {
+         self.backend.wheel(delta, false)
+     }
+@@ -200,6 +205,13 @@ mod tests {
+         assert_eq!(totals, (7, -5));
+     }
+ 
++    #[test]
++    fn home_moves_to_absolute_origin() {
++        let mut controller = Controller::new(FakeBackend::default());
++        controller.home().unwrap();
++        assert_eq!(controller.backend.0, ["absolute:0,0"]);
++    }
++
+     #[test]
+     fn playback_filter_excludes_requested_event_types() {
+         let events = [
+diff --git a/src/main.rs b/src/main.rs
+index 3bf9660..31175ef 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -119,6 +119,9 @@ fn control(command: Command) -> Result<()> {
+                     .with_context(|| format!("cannot open recording at {}", input.display()))?,
+             );
+             let events: Vec<MouseEvent> = serde_json::from_reader(reader)?;
++            mouse
++                .home()
++                .context("cannot move mouse to the home position before playback")?;
+             mouse.play(
+                 &events,
+                 speed,
+@@ -135,7 +138,16 @@ fn control(command: Command) -> Result<()> {
+ }
+ 
+ fn record(output: PathBuf, stop_button: Button) -> Result<()> {
++    // Open physical devices before creating uinput devices so recording cannot
++    // include events from the virtual mouse used for homing.
+     let mut listener = Listener::new()?;
++    let mut mouse = Controller::new(
++        LinuxMouse::new().context("cannot create uinput device; check /dev/uinput permissions")?,
++    );
++    mouse
++        .home()
++        .context("cannot move mouse to the home position before recording")?;
++
+     let mut events = Vec::new();
+     listener.listen_until(|event| {
+         let stopped = matches!(
+[0m
+The repository is already the Rust refactor of `boppreh/mouse`; only keyboard parity and the perception/control layer are missing. I found uncommitted homing changes in the mouse files and will build around them without replacing them; the implementation will use Linux `evdev/uinput`, ordered image frames as observations, and an OpenAI-compatible GPT-Sol policy endpoint with a dry-run default so model output cannot control the desktop accidentally.
+[0m→ [0mRead CONTRIBUTING.md
+[0m✱ [0mGlob ".github/**/*"[90m in . · 0 matches[0m
+[0m→ [0mRead docs/MIGRATION.md
+[0m
+[0m$ [0mcargo test --all-targets --all-features
+Finished `test` profile [unoptimized + debuginfo] target(s) in 0.09s
+     Running unittests src/lib.rs (target/debug/deps/computeruse-53b587dd7d330347)
+
+running 8 tests
+test controller::tests::click_and_double_click_preserve_order ... ok
+test controller::tests::home_moves_to_absolute_origin ... ok
+test event::tests::button_aliases_parse ... ok
+test controller::tests::playback_filter_excludes_requested_event_types ... ok
+test event::tests::events_round_trip_as_tagged_json ... ok
+test linux::tests::converts_linux_button_events ... ok
+test linux::tests::ignores_unknown_linux_events ... ok
+test controller::tests::animated_motion_reaches_exact_destination ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (target/debug/deps/computeruse-f44470a99cd3a144)
+[0m
+[0m% [0mWebFetch https://raw.githubusercontent.com/boppreh/keyboard/master/keyboard/__init__.py
+[0m→ [0mRead .gitignore
+[0m✱ [0mGrep "pub struct KeyCode|KEY_A|KEY_LEFTCTRL"[90m in /home/opencode/.cargo/registry/src · 100 matches[0m
+[0m✱ [0mGrep "struct VirtualDeviceBuilder|with_keys"[90m in /home/opencode/.cargo/registry/src · 46 matches[0m
+[0m✱ [0mGlob "evdev-0.13.2/src/**/*.rs"[90m in /home/opencode/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f · 16 matches[0m
+[0m→ [0mRead /home/opencode/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/evdev-0.13.2/examples/virtual_keyboard.rs
+[0m✱ [0mGrep "KEY_MAX|KEY_LEFTCTRL|pub struct KeyCode"[90m in /home/opencode/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/evdev-0.13.2/src · 4 matches[0m
+[0m→ [0mRead /home/opencode/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/evdev-0.13.2/src/scancodes.rs[90m [offset=1, limit=180][0m
+I’m adding three bounded components rather than coupling model calls directly to device code: a Rust keyboard controller/listener with record/play parity, a frame trajectory source that only accepts image files and tracks unseen frames, and a typed policy/action protocol. The agent command will require explicit `--execute`; otherwise it prints proposed actions and transition rewards to support evaluation without injecting input.
+[0m% [0mPatch 4 files
+[0m% [0mPatch 1 file
+[0m% [0mPatch 1 file
+[0m
+[0m# [0mTodos
+[✓] Inspect repository architecture, current keyboard/mouse hooks, screencast handling, and instruction formats
+[•] Refactor the required input event layer to Rust using boppreh/keyboard-compatible behavior
+[ ] Implement screencast frame reading and state trajectory preparation from the specified directory
+[ ] Integrate an instruction-driven GPT-Sol reinforcement/control loop for keyboard and mouse actions
+[ ] Add tests/documentation and run end-to-end verification
+[0m
+[0m$ [0mgit diff --stat && git status --short
+Cargo.toml        |   2 +
+ README.md         |  12 ++-
+ src/controller.rs |  12 +++
+ src/lib.rs        |   8 +-
+ src/linux.rs      | 144 +++++++++++++++++++++++++++-
+ src/main.rs       | 273 +++++++++++++++++++++++++++++++++++++++++++++++++++++-
+ 6 files changed, 440 insertions(+), 11 deletions(-)
+ M Cargo.toml
+ M README.md
+ M src/controller.rs
+ M src/lib.rs
+ M src/linux.rs
+ M src/main.rs
+?? gui_spec
+?? gui_spec.out
+?? homing
+?? homing.out
+?? src/agent.rs
+?? src/keyboard.rs
+[0m
+[0m$ [0mcargo check --all-targets --all-features
+Updating crates.io index
+     Locking 115 packages to latest Rust 1.88 compatible versions
+      Adding atomic-waker v1.1.2
+      Adding base64 v0.22.1 (available: v0.23.1)
+      Adding bumpalo v3.20.3
+      Adding bytes v1.12.1
+      Adding cc v1.4.5
+      Adding chacha20 v0.10.2
+      Adding cpufeatures v0.3.1
+      Adding displaydoc v0.2.7
+      Adding find-msvc-tools v0.1.12
+      Adding form_urlencoded v1.2.2
+      Adding futures-channel v0.3.34
+      Adding futures-core v0.3.34
+      Adding futures-io v0.3.34
+      Adding futures-sink v0.3.34
+      Adding futures-task v0.3.34
+      Adding futures-util v0.3.34
+      Adding getrandom v0.2.17
+      Adding getrandom v0.4.3
+      Adding http v1.5.0
+      Adding http-body v1.1.0
+      Adding http-body-util v0.1.5
+      Adding httparse v1.10.1
+      Adding hyper v1.11.1
+      Adding hyper-rustls v0.27.9
+      Adding hyper-util v0.1.20
+      Adding icu_collections v2.3.0
+      Adding icu_locale_core v2.3.0
+      Adding icu_normalizer v2.3.0
+      Adding icu_normalizer_data v2.3.0
+      Adding icu_properties v2.3.0
+      Adding icu_properties_data v2.3.0
+      Adding icu_provider v2.3.1
+      Adding idna v1.1.0
+      Adding idna_adapter v1.2.2
+      Adding ipnet v2.12.2
+      Adding js-sys v0.3.105
+      Adding litemap v0.8.3
+      Adding log v0.4.34
+      Adding lru-slab v0.1.2
+      Adding mio v1.2.3
+      Adding once_cell v1.21.4
+      Adding percent-encoding v2.3.2
+      Adding pin-project-lite v0.2.17
+      Adding potential_utf v0.1.6
+      Adding quinn v0.11.11
+      Adding quinn-proto v0.11.17
+      Adding quinn-udp v0.5.15
+      Adding r-efi v6.0.0
+      Adding rand v0.10.2
+      Adding rand_core v0.10.1
+      Adding rand_pcg v0.10.2
+      Adding reqwest v0.12.28 (available: v0.13.4)
+      Adding ring v0.17.14
+      Adding rustc-hash v2.1.3
+      Adding rustls v0.23.44
+      Adding rustls-pki-types v1.15.1
+      Adding rustls-webpki v0.103.15
+      Adding rustversion v1.0.23
+      Adding ryu v1.0.23
+      Adding serde_urlencoded v0.7.1
+      Adding shlex v2.0.1
+      Adding slab v0.4.12
+      Adding smallvec v1.16.0
+      Adding socket2 v0.6.5
+      Adding stable_deref_trait v1.2.1
+      Adding subtle v2.6.1
+      Adding syn v2.0.119
+      Adding sync_wrapper v1.0.2
+      Adding synstructure v0.13.2
+      Adding thiserror v2.0.20
+      Adding thiserror-impl v2.0.20
+      Adding tinystr v0.8.4
+      Adding tinyvec v1.13.2
+      Adding tinyvec_macros v0.1.1
+      Adding tokio v1.53.1
+      Adding tokio-rustls v0.26.5
+      Adding tower v0.5.3
+      Adding tower-http v0.6.11
+      Adding tower-layer v0.3.3
+      Adding tower-service v0.3.3
+      Adding tracing v0.1.44
+      Adding tracing-core v0.1.36
+      Adding try-lock v0.2.5
+      Adding untrusted v0.9.0
+      Adding url v2.5.8
+      Adding utf8_iter v1.0.4
+      Adding want v0.3.1
+      Adding wasi v0.11.1+wasi-snapshot-preview1
+      Adding wasm-bindgen v0.2.128
+      Adding wasm-bindgen-futures v0.4.78
+      Adding wasm-bindgen-macro v0.2.128
+      Adding wasm-bindgen-macro-support v0.2.128
+      Adding wasm-bindgen-shared v0.2.128
+      Adding web-sys v0.3.105
+      Adding web-time v1.1.0
+      Adding webpki-roots v1.0.9
+      Adding windows-sys v0.52.0
+      Adding windows-targets v0.52.6
+      Adding windows_aarch64_gnullvm v0.52.6
+      Adding windows_aarch64_msvc v0.52.6
+      Adding windows_i686_gnu v0.52.6
+      Adding windows_i686_gnullvm v0.52.6
+      Adding windows_i686_msvc v0.52.6
+      Adding windows_x86_64_gnu v0.52.6
+      Adding windows_x86_64_gnullvm v0.52.6
+      Adding windows_x86_64_msvc v0.52.6
+      Adding writeable v0.6.4
+      Adding yoke v0.8.3
+      Adding yoke-derive v0.8.2
+      Adding zerofrom v0.1.8
+      Adding zerofrom-derive v0.1.7
+      Adding zeroize v1.9.0
+      Adding zerotrie v0.2.5
+      Adding zerovec v0.11.8
+      Adding zerovec-derive v0.11.6
+ Downloading crates ...
+  Downloaded cpufeatures v0.3.1
+  Downloaded futures-task v0.3.34
+  Downloaded atomic-waker v1.1.2
+  Downloaded futures-sink v0.3.34
+  Downloaded http-body v1.1.0
+  Downloaded find-msvc-tools v0.1.12
+  Downloaded displaydoc v0.2.7
+  Downloaded tinystr v0.8.4
+  Downloaded chacha20 v0.10.2
+  Downloaded socket2 v0.6.5
+  Downloaded getrandom v0.4.3
+  Downloaded rand v0.10.2
+  Downloaded base64 v0.22.1
+  Downloaded bytes v1.12.1
+  Downloaded cc v1.4.5
+  Downloaded form_urlencoded v1.2.2
+  Downloaded http v1.5.0
+  Downloaded futures-util v0.3.34
+  Downloaded hyper-rustls v0.27.9
+  Downloaded serde_urlencoded v0.7.1
+  Downloaded shlex v2.0.1
+  Downloaded tinyvec_macros v0.1.1
+  Downloaded yoke v0.8.3
+  Downloaded litemap v0.8.3
+  Downloaded lru-slab v0.1.2
+  Downloaded rustc-hash v2.1.3
+  Downloaded tokio-rustls v0.26.5
+  Downloaded tower-http v0.6.11
+  Downloaded ipnet v2.12.2
+  Downloaded rustls-webpki v0.103.15
+  Downloaded ryu v1.0.23
+  Downloaded slab v0.4.12
+  Downloaded zerovec-derive v0.11.6
+  Downloaded rand_core v0.10.1
+  Downloaded subtle v2.6.1
+  Downloaded sync_wrapper v1.0.2
+  Downloaded tower-layer v0.3.3
+  Downloaded tower-service v0.3.3
+  Downloaded tracing-core v0.1.36
+  Downloaded untrusted v0.9.0
+  Downloaded utf8_iter v1.0.4
+  Downloaded want v0.3.1
+  Downloaded zerofrom v0.1.8
+  Downloaded futures-core v0.3.34
+  Downloaded hyper v1.11.1
+  Downloaded idna_adapter v1.2.2
+  Downloaded try-lock v0.2.5
+  Downloaded pin-project-lite v0.2.17
+  Downloaded potential_utf v0.1.6
+  Downloaded stable_deref_trait v1.2.1
+  Downloaded yoke-derive v0.8.2
+  Downloaded zerofrom-derive v0.1.7
+  Downloaded icu_provider v2.3.1
+  Downloaded http-body-util v0.1.5
+  Downloaded futures-io v0.3.34
+  Downloaded rand_pcg v0.10.2
+  Downloaded smallvec v1.16.0
+  Downloaded synstructure v0.13.2
+  Downloaded writeable v0.6.4
+  Downloaded zeroize v1.9.0
+  Downloaded quinn-udp v0.5.15
+  Downloaded rustls-pki-types v1.15.1
+  Downloaded tinyvec v1.13.2
+  Downloaded url v2.5.8
+  Downloaded futures-channel v0.3.34
+  Downloaded log v0.4.34
+  Downloaded zerovec v0.11.8
+  Downloaded httparse v1.10.1
+  Downloaded reqwest v0.12.28
+  Downloaded zerotrie v0.2.5
+  Downloaded icu_locale_core v2.3.0
+  Downloaded mio v1.2.3
+  Downloaded icu_normalizer_data v2.3.0
+  Downloaded icu_collections v2.3.0
+  Downloaded tower v0.5.3
+  Downloaded quinn v0.11.11
+  Downloaded icu_properties v2.3.0
+  Downloaded idna v1.1.0
+  Downloaded hyper-util v0.1.20
+  Downloaded icu_properties_data v2.3.0
+  Downloaded webpki-roots v1.0.9
+  Downloaded quinn-proto v0.11.17
+  Downloaded syn v2.0.119
+  Downloaded rustls v0.23.44
+  Downloaded tracing v0.1.44
+  Downloaded icu_normalizer v2.3.0
+  Downloaded tokio v1.53.1
+  Downloaded ring v0.17.14
+    Checking stable_deref_trait v1.2.1
+    Checking pin-project-lite v0.2.17
+   Compiling syn v3.0.5
+   Compiling syn v2.0.119
+    Checking bytes v1.12.1
+   Compiling find-msvc-tools v0.1.12
+   Compiling shlex v2.0.1
+    Checking futures-core v0.3.34
+   Compiling cc v1.4.5
+    Checking litemap v0.8.3
+    Checking smallvec v1.16.0
+    Checking writeable v0.6.4
+    Checking socket2 v0.6.5
+    Checking mio v1.2.3
+   Compiling icu_normalizer_data v2.3.0
+   Compiling icu_properties_data v2.3.0
+    Checking futures-sink v0.3.34
+    Checking utf8_iter v1.0.4
+    Checking tokio v1.53.1
+   Compiling ring v0.17.14
+   Compiling synstructure v0.13.2
+   Compiling zerofrom-derive v0.1.7
+    Checking zerofrom v0.1.8
+   Compiling yoke-derive v0.8.2
+    Checking yoke v0.8.3
+    Checking http v1.5.0
+   Compiling zerovec-derive v0.11.6
+   Compiling displaydoc v0.2.7
+    Checking memchr v2.8.3
+    Checking zerotrie v0.2.5
+    Checking once_cell v1.21.4
+    Checking percent-encoding v2.3.2
+    Checking zeroize v1.9.0
+    Checking zerovec v0.11.8
+    Checking http-body v1.1.0
+    Checking rustls-pki-types v1.15.1
+    Checking getrandom v0.2.17
+    Checking futures-io v0.3.34
+   Compiling httparse v1.10.1
+    Checking untrusted v0.9.0
+    Checking futures-task v0.3.34
+    Checking slab v0.4.12
+    Checking tinystr v0.8.4
+    Checking potential_utf v0.1.6
+    Checking futures-util v0.3.34
+    Checking icu_collections v2.3.0
+    Checking icu_locale_core v2.3.0
+    Checking try-lock v0.2.5
+   Compiling rustls v0.23.44
+    Checking tower-service v0.3.3
+    Checking want v0.3.1
+    Checking form_urlencoded v1.2.2
+    Checking icu_provider v2.3.1
+    Checking tracing-core v0.1.36
+    Checking icu_properties v2.3.0
+    Checking icu_normalizer v2.3.0
+    Checking rustls-webpki v0.103.15
+    Checking futures-channel v0.3.34
+    Checking atomic-waker v1.1.2
+    Checking subtle v2.6.1
+    Checking hyper v1.11.1
+    Checking idna_adapter v1.2.2
+    Checking idna v1.1.0
+    Checking tracing v0.1.44
+   Compiling serde_derive v1.0.229
+    Checking sync_wrapper v1.0.2
+    Checking base64 v0.22.1
+    Checking tower-layer v0.3.3
+    Checking ipnet v2.12.2
+    Checking tower v0.5.3
+    Checking hyper-util v0.1.20
+    Checking url v2.5.8
+    Checking webpki-roots v1.0.9
+    Checking ryu v1.0.23
+   Compiling clap_derive v4.6.4
+    Checking serde_json v1.0.151
+    Checking tokio-rustls v0.26.5
+    Checking hyper-rustls v0.27.9
+    Checking tower-http v0.6.11
+    Checking http-body-util v0.1.5
+    Checking log v0.4.34
+    Checking clap v4.6.6
+    Checking serde v1.0.229
+    Checking serde_urlencoded v0.7.1
+    Checking reqwest v0.12.28
+    Checking computeruse v0.1.0 (/home/opencode/computeruse)
+error[E0282]: type annotations needed
+   --> src/keyboard.rs:119:29
+    |
+119 |                 let delay = ((event.time - previous) / speed).max(0.0);
+    |                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ cannot infer type
+
+error[E0029]: only `char` and numeric types are allowed in range patterns
+   --> src/keyboard.rs:196:9
+    |
+196 |         "f1"..="f10" => 58 + name[1..].parse::<u16>().ok()?,
+    |         ----^^^-----
+    |         |      |
+    |         |      this is of type `&'static str` but it should be `char` or numeric
+    |         this is of type `&'static str` but it should be `char` or numeric
+
+Some errors have detailed explanations: E0029, E0282.
+For more information about an error, try `rustc --explain E0029`.
+error: could not compile `computeruse` (lib) due to 2 previous errors
+warning: build failed, waiting for other jobs to finish...
+error: could not compile `computeruse` (lib test) due to 2 previous errors
+[0m
+[0m% [0mPatch 1 file
+[0m
+[0m$ [0mcargo check --all-targets --all-features
+Checking computeruse v0.1.0 (/home/opencode/computeruse)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.70s
+[0m
+The first compile pass exposed only two local type/parsing issues, now fixed. Before final verification I’m tightening frame semantics so an executing agent starts from the newest available trajectory rather than replaying stale screenshots, and then waits for newly created frames after each action.
+[0m% [0mPatch 1 file
+[0m✱ [0mGlob "Cargo.lock"[90m in . · 1 match[0m
+[0m% [0mPatch 3 files
+[0m
+[0m$ [0mcargo fmt --all -- --check
+Diff in /home/opencode/computeruse/src/agent.rs:172:
+     pub fn from_env(model: impl Into<String>) -> Result<Self> {
+         let api_key = std::env::var("OPENAI_API_KEY")
+             .context("OPENAI_API_KEY is required for the agent command")?;
+[31m-        let base_url = std::env::var("OPENAI_BASE_URL")
+(B[m[31m-            .unwrap_or_else(|_| "https://api.openai.com/v1".into());
+(B[m[32m+        let base_url =
+(B[m[32m+            std::env::var("OPENAI_BASE_URL").unwrap_or_else(|_| "https://api.openai.com/v1".into());
+(B[m         Ok(Self {
+[31m-            client: Client::builder().timeout(Duration::from_secs(120)).build()?,
+(B[m[32m+            client: Client::builder()
+(B[m[32m+                .timeout(Duration::from_secs(120))
+(B[m[32m+                .build()?,
+(B[m             endpoint: format!("{}/chat/completions", base_url.trim_end_matches('/')),
+             api_key,
+             model: model.into(),
+Diff in /home/opencode/computeruse/src/agent.rs:252:
+             .or_else(|| trimmed.strip_prefix("```JSON"))
+             .or_else(|| trimmed.strip_prefix("```"))
+             .unwrap_or(trimmed);
+[31m-        without_opening.strip_suffix("```").unwrap_or(without_opening).trim()
+(B[m[32m+        without_opening
+(B[m[32m+            .strip_suffix("```")
+(B[m[32m+            .unwrap_or(without_opening)
+(B[m[32m+            .trim()
+(B[m     } else {
+         trimmed
+     };
+Diff in /home/opencode/computeruse/src/agent.rs:286:
+ 
+     #[test]
+     fn accepts_fenced_policy_json() {
+[31m-        let decision = parse_decision(
+(B[m[31m-            "```json\n{\"actions\":[],\"completed\":true,\"progress\":1.0}\n```",
+(B[m[31m-        )
+(B[m[31m-        .unwrap();
+(B[m[32m+        let decision =
+(B[m[32m+            parse_decision("```json\n{\"actions\":[],\"completed\":true,\"progress\":1.0}\n```")
+(B[m[32m+                .unwrap();
+(B[m         assert!(decision.completed);
+     }
+ }
+Diff in /home/opencode/computeruse/src/keyboard.rs:162:
+         let byte = name.as_bytes()[0];
+         if byte.is_ascii_lowercase() {
+             const LETTER_CODES: [u16; 26] = [
+[31m-                30, 48, 46, 32, 18, 33, 34, 35, 23, 36, 37, 38, 50, 49, 24, 25, 16, 19,
+(B[m[31m-                31, 20, 22, 47, 17, 45, 21, 44,
+(B[m[32m+                30, 48, 46, 32, 18, 33, 34, 35, 23, 36, 37, 38, 50, 49, 24, 25, 16, 19, 31, 20, 22,
+(B[m[32m+                47, 17, 45, 21, 44,
+(B[m             ];
+             return Some(LETTER_CODES[(byte - b'a') as usize]);
+         }
+Diff in /home/opencode/computeruse/src/keyboard.rs:170:
+         if byte.is_ascii_digit() {
+[31m-            return Some(if byte == b'0' { 11 } else { u16::from(byte - b'1') + 2 });
+(B[m[32m+            return Some(if byte == b'0' {
+(B[m[32m+                11
+(B[m[32m+            } else {
+(B[m[32m+                u16::from(byte - b'1') + 2
+(B[m[32m+            });
+(B[m         }
+     }
+[31m-    if let Some(number) = name.strip_prefix('f').and_then(|value| value.parse::<u16>().ok())
+(B[m[32m+    if let Some(number) = name
+(B[m[32m+        .strip_prefix('f')
+(B[m[32m+        .and_then(|value| value.parse::<u16>().ok())
+(B[m         && (1..=10).contains(&number)
+     {
+         return Some(58 + number);
+Diff in /home/opencode/computeruse/src/keyboard.rs:226:
+ 
+ fn key_name(scan_code: u16) -> String {
+     for name in [
+[31m-        "escape", "backspace", "tab", "enter", "left_ctrl", "left_shift", "right_shift",
+(B[m[31m-        "left_alt", "space", "caps_lock", "f1", "f2", "f3", "f4", "f5", "f6", "f7",
+(B[m[31m-        "f8", "f9", "f10", "f11", "f12", "right_ctrl", "right_alt", "home", "up",
+(B[m[31m-        "page_up", "left", "right", "end", "down", "page_down", "insert", "delete",
+(B[m[31m-        "left_meta", "right_meta", "menu",
+(B[m[32m+        "escape",
+(B[m[32m+        "backspace",
+(B[m[32m+        "tab",
+(B[m[32m+        "enter",
+(B[m[32m+        "left_ctrl",
+(B[m[32m+        "left_shift",
+(B[m[32m+        "right_shift",
+(B[m[32m+        "left_alt",
+(B[m[32m+        "space",
+(B[m[32m+        "caps_lock",
+(B[m[32m+        "f1",
+(B[m[32m+        "f2",
+(B[m[32m+        "f3",
+(B[m[32m+        "f4",
+(B[m[32m+        "f5",
+(B[m[32m+        "f6",
+(B[m[32m+        "f7",
+(B[m[32m+        "f8",
+(B[m[32m+        "f9",
+(B[m[32m+        "f10",
+(B[m[32m+        "f11",
+(B[m[32m+        "f12",
+(B[m[32m+        "right_ctrl",
+(B[m[32m+        "right_alt",
+(B[m[32m+        "home",
+(B[m[32m+        "up",
+(B[m[32m+        "page_up",
+(B[m[32m+        "left",
+(B[m[32m+        "right",
+(B[m[32m+        "end",
+(B[m[32m+        "down",
+(B[m[32m+        "page_down",
+(B[m[32m+        "insert",
+(B[m[32m+        "delete",
+(B[m[32m+        "left_meta",
+(B[m[32m+        "right_meta",
+(B[m[32m+        "menu",
+(B[m     ] {
+         if parse_key_code(name) == Some(scan_code) {
+             return name.into();
+Diff in /home/opencode/computeruse/src/lib.rs:3:
+ //! The Linux implementation uses the kernel `evdev` and `uinput` interfaces,
+ //! so it does not depend on X11 and works with both Xorg and Wayland sessions.
+ 
+[31m-mod controller;
+(B[m mod agent;
+[32m+mod controller;
+(B[m mod event;
+ mod keyboard;
+ 
+Diff in /home/opencode/computeruse/src/lib.rs:11:
+ #[cfg(target_os = "linux")]
+ mod linux;
+ 
+[31m-pub use controller::{Controller, MouseBackend, PlaybackFilter};
+(B[m pub use agent::{Action, AgentDecision, Frame, FrameSource, GptSolPolicy, Policy, Transition};
+[32m+pub use controller::{Controller, MouseBackend, PlaybackFilter};
+(B[m pub use event::{Button, ButtonState, MouseEvent};
+ pub use keyboard::{
+     Key, KeyState, KeyboardBackend, KeyboardController, KeyboardEvent, KeyboardPlaybackFilter,
+Diff in /home/opencode/computeruse/src/main.rs:317:
+         let trajectory = frames
+             .next(options.frame_timeout)?
+             .with_context(|| format!("timed out waiting for a new frame at step {step}"))?;
+[31m-        let frame = trajectory.back().expect("trajectory has a new frame").path.clone();
+(B[m[32m+        let frame = trajectory
+(B[m[32m+            .back()
+(B[m[32m+            .expect("trajectory has a new frame")
+(B[m[32m+            .path
+(B[m[32m+            .clone();
+(B[m         let decision = policy.decide(&instructions, trajectory, &transitions)?;
+         if decision.actions.len() > 16 {
+             bail!("policy proposed more than 16 actions in one step");
+Diff in /home/opencode/computeruse/src/main.rs:365:
+                 mouse.horizontal_wheel(*delta)?
+             }
+             Action::Scroll { delta, .. } => mouse.wheel(*delta)?,
+[31m-            Action::KeyPress { key } => keyboard.press(&key.parse().map_err(anyhow::Error::msg)?)?,
+(B[m[32m+            Action::KeyPress { key } => {
+(B[m[32m+                keyboard.press(&key.parse().map_err(anyhow::Error::msg)?)?
+(B[m[32m+            }
+(B[m             Action::KeyRelease { key } => {
+                 keyboard.release(&key.parse().map_err(anyhow::Error::msg)?)?
+             }
+[0m
+[0m$ [0mcargo fmt --all
+(no output)
+[0m
+The core implementation and user-facing workflow are now in place, including keyboard migration notes and the agent’s dry-run/execute safety boundary. I’m running the full Rust test, lint, formatting, and documentation gates now; hardware injection and a live GPT endpoint remain environment-dependent and will be reported separately.
+[0m$ [0mcargo fmt --all -- --check
+(no output)
+[0m
+[0m$ [0mcargo test --all-targets --all-features
+Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+   Compiling stable_deref_trait v1.2.1
+   Compiling bytes v1.12.1
+   Compiling zerofrom v0.1.8
+   Compiling pin-project-lite v0.2.17
+   Compiling futures-core v0.3.34
+   Compiling litemap v0.8.3
+   Compiling yoke v0.8.3
+   Compiling smallvec v1.16.0
+   Compiling zerovec v0.11.8
+   Compiling writeable v0.6.4
+   Compiling zerotrie v0.2.5
+   Compiling mio v1.2.3
+   Compiling socket2 v0.6.5
+   Compiling futures-sink v0.3.34
+   Compiling utf8_iter v1.0.4
+   Compiling tinystr v0.8.4
+   Compiling potential_utf v0.1.6
+   Compiling icu_collections v2.3.0
+   Compiling icu_locale_core v2.3.0
+   Compiling tokio v1.53.1
+   Compiling http v1.5.0
+   Compiling percent-encoding v2.3.2
+   Compiling zeroize v1.9.0
+   Compiling once_cell v1.21.4
+   Compiling icu_provider v2.3.1
+   Compiling memchr v2.8.3
+   Compiling http-body v1.1.0
+   Compiling rustls-pki-types v1.15.1
+   Compiling icu_normalizer_data v2.3.0
+   Compiling icu_properties_data v2.3.0
+   Compiling getrandom v0.2.17
+   Compiling slab v0.4.12
+   Compiling futures-task v0.3.34
+   Compiling futures-io v0.3.34
+   Compiling untrusted v0.9.0
+   Compiling ring v0.17.14
+   Compiling futures-util v0.3.34
+   Compiling icu_properties v2.3.0
+   Compiling icu_normalizer v2.3.0
+   Compiling tower-service v0.3.3
+   Compiling try-lock v0.2.5
+   Compiling want v0.3.1
+   Compiling idna_adapter v1.2.2
+   Compiling rustls-webpki v0.103.15
+   Compiling httparse v1.10.1
+   Compiling tracing-core v0.1.36
+   Compiling form_urlencoded v1.2.2
+   Compiling futures-channel v0.3.34
+   Compiling subtle v2.6.1
+   Compiling atomic-waker v1.1.2
+   Compiling hyper v1.11.1
+   Compiling rustls v0.23.44
+   Compiling tracing v0.1.44
+   Compiling idna v1.1.0
+   Compiling sync_wrapper v1.0.2
+   Compiling base64 v0.22.1
+   Compiling tower-layer v0.3.3
+   Compiling ipnet v2.12.2
+   Compiling hyper-util v0.1.20
+   Compiling tower v0.5.3
+   Compiling url v2.5.8
+   Compiling serde v1.0.229
+   Compiling webpki-roots v1.0.9
+   Compiling ryu v1.0.23
+   Compiling serde_json v1.0.151
+   Compiling serde_urlencoded v0.7.1
+   Compiling tower-http v0.6.11
+   Compiling http-body-util v0.1.5
+   Compiling log v0.4.34
+   Compiling clap v4.6.6
+   Compiling tokio-rustls v0.26.5
+   Compiling hyper-rustls v0.27.9
+   Compiling reqwest v0.12.28
+   Compiling computeruse v0.1.0 (/home/opencode/computeruse)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 14.74s
+     Running unittests src/lib.rs (target/debug/deps/computeruse-0b4a1abf3c1aab6f)
+
+running 14 tests
+test agent::tests::accepts_fenced_policy_json ... ok
+test agent::tests::recognizes_supported_frame_types ... ok
+test controller::tests::click_and_double_click_preserve_order ... ok
+test agent::tests::action_protocol_round_trips ... ok
+test controller::tests::home_moves_to_absolute_origin ... ok
+test controller::tests::playback_filter_excludes_requested_event_types ... ok
+test event::tests::button_aliases_parse ... ok
+test keyboard::tests::hotkey_presses_in_order_and_releases_in_reverse ... ok
+test event::tests::events_round_trip_as_tagged_json ... ok
+test linux::tests::converts_linux_button_events ... ok
+test linux::tests::ignores_unknown_linux_events ... ok
+test linux::tests::converts_linux_keyboard_events_and_repeats ... ok
+test keyboard::tests::key_events_round_trip ... ok
+test controller::tests::animated_motion_reaches_exact_destination ... ok
+
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (target/debug/deps/computeruse-47ad954a76633900)
+[0m
+[0m$ [0mcargo doc --no-deps
+Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on build directory
+ Documenting computeruse v0.1.0 (/home/opencode/computeruse)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 15.50s
+   Generated /home/opencode/computeruse/target/doc/computeruse/index.html
+[0m
+[0m$ [0mcargo clippy --all-targets --all-features -- -D warnings
+Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on build directory
+    Checking computeruse v0.1.0 (/home/opencode/computeruse)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 16.18s
+[0m
+[0m% [0mPatch 1 file
+[0m
+[0m$ [0mgit diff --check && git status --short && git diff --stat
+M CONTRIBUTING.md
+ M Cargo.lock
+ M Cargo.toml
+ M README.md
+ M docs/MIGRATION.md
+ M src/controller.rs
+ M src/lib.rs
+ M src/linux.rs
+ M src/main.rs
+?? gui_spec
+?? gui_spec.out
+?? homing
+?? homing.out
+?? src/agent.rs
+?? src/keyboard.rs
+ CONTRIBUTING.md   |    7 +-
+ Cargo.lock        | 1203 +++++++++++++++++++++++++++++++++++++++++++++++++++--
+ Cargo.toml        |    2 +
+ README.md         |   73 +++-
+ docs/MIGRATION.md |   18 +-
+ src/controller.rs |   12 +
+ src/lib.rs        |    8 +-
+ src/linux.rs      |  144 ++++++-
+ src/main.rs       |  279 ++++++++++++-
+ 9 files changed, 1693 insertions(+), 53 deletions(-)
+[0m
+[0m$ [0mcargo fmt --all -- --check
+(no output)
+[0m
+[0m$ [0mcargo run --quiet -- --help
+Global mouse capture and control for modern Ubuntu, written in Rust
+
+Usage: computeruse <COMMAND>
+
+Commands:
+  click            
+  press            
+  release          
+  move             
+  move-to          
+  wheel            
+  listen           
+  record           
+  play             
+  key-press        
+  key-release      
+  hotkey           
+  keyboard-listen  
+  keyboard-record  
+  keyboard-play    
+  agent            Run the instruction-driven visual policy over screencast frames
+  help             Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help     Print help
+  -V, --version  Print version
+[0m
+[0m$ [0mcargo test --all-targets --all-features
+Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on build directory
+   Compiling computeruse v0.1.0 (/home/opencode/computeruse)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.31s
+     Running unittests src/lib.rs (target/debug/deps/computeruse-0b4a1abf3c1aab6f)
+
+running 15 tests
+test agent::tests::accepts_fenced_policy_json ... ok
+test agent::tests::recognizes_supported_frame_types ... ok
+test agent::tests::action_protocol_round_trips ... ok
+test controller::tests::home_moves_to_absolute_origin ... ok
+test controller::tests::click_and_double_click_preserve_order ... ok
+test controller::tests::playback_filter_excludes_requested_event_types ... ok
+test event::tests::button_aliases_parse ... ok
+test event::tests::events_round_trip_as_tagged_json ... ok
+test keyboard::tests::hotkey_presses_in_order_and_releases_in_reverse ... ok
+test keyboard::tests::key_events_round_trip ... ok
+test linux::tests::converts_linux_button_events ... ok
+test linux::tests::converts_linux_keyboard_events_and_repeats ... ok
+test linux::tests::ignores_unknown_linux_events ... ok
+test agent::tests::frame_source_starts_with_latest_bounded_trajectory ... ok
+test controller::tests::animated_motion_reaches_exact_destination ... ok
+
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (target/debug/deps/computeruse-47ad954a76633900)
+[0m
+[0m% [0mPatch 1 file
+All 15 unit tests now pass, including hotkey ordering, keyboard event round-trips, Linux repeat conversion, policy JSON parsing, and newest-frame trajectory selection. The CLI exposes the full workflow; I’m doing a final defect-focused review and lint pass, with live `/dev/input`, `/dev/uinput`, screencast producer, and API behavior intentionally not invoked in this environment.
+[0m• [0mReview input agent changes[90m General Agent[0m
+[0m
+[0m$ [0mcargo run --quiet -- agent --help
+Run the instruction-driven visual policy over screencast frames
+
+Usage: computeruse agent [OPTIONS] --frames <FRAMES> --instructions <INSTRUCTIONS>
+
+Options:
+      --frames <FRAMES>
+          
+      --instructions <INSTRUCTIONS>
+          
+      --model <MODEL>
+          [default: gpt-5.6-sol]
+      --trajectory <TRAJECTORY>
+          [default: 3]
+      --max-steps <MAX_STEPS>
+          [default: 50]
+      --frame-timeout-ms <FRAME_TIMEOUT_MS>
+          [default: 10000]
+      --execute
+          Actually inject policy actions. Without this flag the agent is a dry run
+      --trace <TRACE>
+          Optional JSONL transition log for evaluation or offline learning
+  -h, --help
+          Print help
+[0m
+[0m$ [0mcargo doc --no-deps
+Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on build directory
+ Documenting computeruse v0.1.0 (/home/opencode/computeruse)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.44s
+   Generated /home/opencode/computeruse/target/doc/computeruse/index.html
+[0m
+[0m$ [0mcargo clippy --all-targets --all-features -- -D warnings
+Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on build directory
+    Checking computeruse v0.1.0 (/home/opencode/computeruse)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.78s
+[0m
+[0m✓ [0mReview input agent changes[90m General Agent[0m
+[0m✱ [0mGrep "fn timestamp|pub fn timestamp"[90m in /home/opencode/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/evdev-0.13.2/src · 2 matches[0m
+[0m→ [0mRead /home/opencode/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/evdev-0.13.2/src/lib.rs[90m [offset=365, limit=25][0m
+The review found two safety defects worth fixing before completion: reused/in-progress frame files could be consumed incorrectly, and model-issued persistent press actions could remain held across timeouts. I’m changing frame identity/read handling, restricting the policy to bounded atomic input actions, validating an entire action batch before injection, balancing the keyboard stop key, and preserving kernel timestamps/repeat events during replay.
+[0m% [0mPatch 2 files
+[0m% [0mPatch 1 file
+[0m% [0mPatch 1 file
+[0m✗ [0mPatch failed
+[91m[1mError: [0mapply_patch verification failed: Error: Failed to find expected lines in /home/opencode/computeruse/README.md:
+`--execute` is deliberately required for input injection, and
+each decision is limited to 16 actions with waits capped at 30 seconds.
+[0m→ [0mRead README.md[90m [offset=125, limit=75][0m
+[0m→ [0mRead docs/MIGRATION.md[90m [offset=35, limit=80][0m
+[0m% [0mPatch 2 files
+[0m
+[0m$ [0mcargo fmt --all -- --check
+(no output)
+[0m
+[0m$ [0mcargo check --all-targets --all-features
+Checking computeruse v0.1.0 (/home/opencode/computeruse)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.71s
+[0m
+[0m% [0mPatch 2 files
+[0m% [0mPatch 1 file
+[0m
+[0m$ [0mcargo fmt --all -- --check
+(no output)
+[0m
+[0m$ [0mcargo test --all-targets --all-features
+Compiling computeruse v0.1.0 (/home/opencode/computeruse)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.78s
+     Running unittests src/lib.rs (target/debug/deps/computeruse-0b4a1abf3c1aab6f)
+
+running 17 tests
+test agent::tests::accepts_fenced_policy_json ... ok
+test agent::tests::recognizes_supported_frame_types ... ok
+test agent::tests::action_protocol_round_trips ... ok
+test controller::tests::click_and_double_click_preserve_order ... ok
+test controller::tests::home_moves_to_absolute_origin ... ok
+test controller::tests::playback_filter_excludes_requested_event_types ... ok
+test event::tests::button_aliases_parse ... ok
+test event::tests::events_round_trip_as_tagged_json ... ok
+test keyboard::tests::hotkey_presses_in_order_and_releases_in_reverse ... ok
+test keyboard::tests::hotkey_releases_pressed_modifiers_after_backend_failure ... ok
+test keyboard::tests::key_events_round_trip ... ok
+test keyboard::tests::playback_emits_repeat_events ... ok
+test linux::tests::converts_linux_button_events ... ok
+test linux::tests::ignores_unknown_linux_events ... ok
+test linux::tests::converts_linux_keyboard_events_and_repeats ... ok
+test agent::tests::frame_source_starts_with_latest_bounded_trajectory ... ok
+test controller::tests::animated_motion_reaches_exact_destination ... ok
+
+test result: ok. 17 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+
+running 1 test
+test tests::agent_actions_are_validated_before_execution ... ok
+     Running unittests src/main.rs (target/debug/deps/computeruse-47ad954a76633900)
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+[0m
+[0m$ [0mcargo doc --no-deps
+Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on build directory
+ Documenting computeruse v0.1.0 (/home/opencode/computeruse)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.44s
+   Generated /home/opencode/computeruse/target/doc/computeruse/index.html
+[0m
+[0m$ [0mcargo clippy --all-targets --all-features -- -D warnings
+Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on build directory
+    Checking computeruse v0.1.0 (/home/opencode/computeruse)
+error: the variable `pressed` is used as a loop counter
+  --> src/keyboard.rs:96:9
+   |
+96 |         for key in keys {
+   |         ^^^^^^^^^^^^^^^ help: consider using: `for (pressed, key) in keys.iter().enumerate()`
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#explicit_counter_loop
+   = note: `-D clippy::explicit-counter-loop` implied by `-D warnings`
+   = help: to override `-D warnings` add `#[allow(clippy::explicit_counter_loop)]`
+
+error: could not compile `computeruse` (lib) due to 1 previous error
+warning: build failed, waiting for other jobs to finish...
+error: could not compile `computeruse` (lib test) due to 1 previous error
+[0m
+[0m% [0mPatch 1 file
+[0m• [0mVerify safety fixes[90m General Agent[0m
+[0m
+[0m$ [0mgit diff --check && git status --short && git diff --stat
+M CONTRIBUTING.md
+ M Cargo.lock
+ M Cargo.toml
+ M README.md
+ M docs/MIGRATION.md
+ M src/controller.rs
+ M src/lib.rs
+ M src/linux.rs
+ M src/main.rs
+?? gui_spec
+?? gui_spec.out
+?? homing
+?? homing.out
+?? src/agent.rs
+?? src/keyboard.rs
+ CONTRIBUTING.md   |    7 +-
+ Cargo.lock        | 1203 +++++++++++++++++++++++++++++++++++++++++++++++++++--
+ Cargo.toml        |    6 +-
+ README.md         |   79 +++-
+ docs/MIGRATION.md |   42 +-
+ src/controller.rs |   12 +
+ src/lib.rs        |    8 +-
+ src/linux.rs      |  165 +++++++-
+ src/main.rs       |  343 ++++++++++++++-
+ 9 files changed, 1809 insertions(+), 56 deletions(-)
+[0m
+[0m$ [0mcargo fmt --all -- --check
+(no output)
+[0m
+[0m$ [0mcargo clippy --all-targets --all-features -- -D warnings
+Checking computeruse v0.1.0 (/home/opencode/computeruse)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.78s
+[0m
+[0m✓ [0mVerify safety fixes[90m General Agent[0m
+The follow-up review confirmed persistent holds are eliminated, but identified two remaining pre-execution gaps: a paused non-atomic image write could look stable, and raw `code:` keys were parsed without checking Linux’s supported range. I’m closing both by validating complete PNG/JPEG/WebP containers before accepting a frame and validating every key’s injectability before any action in the batch runs.
+[0m% [0mPatch 3 files
+[0m
+[0m$ [0mcargo fmt --all -- --check
+(no output)
+[0m
+[0m$ [0mcargo test --all-targets --all-features
+Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+   Compiling computeruse v0.1.0 (/home/opencode/computeruse)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.30s
+     Running unittests src/lib.rs (target/debug/deps/computeruse-0b4a1abf3c1aab6f)
+
+running 18 tests
+test agent::tests::accepts_fenced_policy_json ... ok
+test agent::tests::action_protocol_round_trips ... ok
+test agent::tests::recognizes_supported_frame_types ... ok
+test agent::tests::rejects_incomplete_image_containers ... ok
+test controller::tests::click_and_double_click_preserve_order ... ok
+test controller::tests::playback_filter_excludes_requested_event_types ... ok
+test controller::tests::home_moves_to_absolute_origin ... ok
+test event::tests::button_aliases_parse ... ok
+test event::tests::events_round_trip_as_tagged_json ... ok
+test keyboard::tests::hotkey_presses_in_order_and_releases_in_reverse ... ok
+test keyboard::tests::hotkey_releases_pressed_modifiers_after_backend_failure ... ok
+test keyboard::tests::playback_emits_repeat_events ... ok
+test keyboard::tests::key_events_round_trip ... ok
+test linux::tests::converts_linux_button_events ... ok
+test linux::tests::converts_linux_keyboard_events_and_repeats ... ok
+test linux::tests::ignores_unknown_linux_events ... ok
+test agent::tests::frame_source_starts_with_latest_bounded_trajectory ... ok
+test controller::tests::animated_motion_reaches_exact_destination ... ok
+
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running unittests src/main.rs (target/debug/deps/computeruse-47ad954a76633900)
+
+running 1 test
+test tests::agent_actions_are_validated_before_execution ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+[0m
+[0m$ [0mcargo doc --no-deps
+Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on build directory
+ Documenting computeruse v0.1.0 (/home/opencode/computeruse)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.03s
+   Generated /home/opencode/computeruse/target/doc/computeruse/index.html
+[0m
+[0m$ [0mcargo clippy --all-targets --all-features -- -D warnings
+Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on build directory
+    Checking computeruse v0.1.0 (/home/opencode/computeruse)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.49s
+[0m
+[0m• [0mConfirm blocking issues closed[90m General Agent[0m
+[0m
+[0m$ [0mgit diff --check && git status --short && git diff --stat
+M CONTRIBUTING.md
+ M Cargo.lock
+ M Cargo.toml
+ M README.md
+ M docs/MIGRATION.md
+ M src/controller.rs
+ M src/lib.rs
+ M src/linux.rs
+ M src/main.rs
+?? gui_spec
+?? gui_spec.out
+?? homing
+?? homing.out
+?? src/agent.rs
+?? src/keyboard.rs
+ CONTRIBUTING.md   |    7 +-
+ Cargo.lock        | 1203 +++++++++++++++++++++++++++++++++++++++++++++++++++--
+ Cargo.toml        |    6 +-
+ README.md         |   79 +++-
+ docs/MIGRATION.md |   42 +-
+ src/controller.rs |   12 +
+ src/lib.rs        |    8 +-
+ src/linux.rs      |  169 +++++++-
+ src/main.rs       |  363 +++++++++++++++-
+ 9 files changed, 1833 insertions(+), 56 deletions(-)
+[0m
+[0m$ [0mcargo run --quiet -- --help
+Global input capture and vision-guided control for modern Ubuntu, written in Rust
+
+Usage: computeruse <COMMAND>
+
+Commands:
+  click            
+  press            
+  release          
+  move             
+  move-to          
+  wheel            
+  listen           
+  record           
+  play             
+  key-press        
+  key-release      
+  hotkey           
+  keyboard-listen  
+  keyboard-record  
+  keyboard-play    
+  agent            Run the instruction-driven visual policy over screencast frames
+  help             Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help     Print help
+  -V, --version  Print version
+[0m
+[0m✓ [0mConfirm blocking issues closed[90m General Agent[0m
+[0m
+[0m# [0mTodos
+[✓] Inspect repository architecture, current keyboard/mouse hooks, screencast handling, and instruction formats
+[✓] Refactor the required input event layer to Rust using boppreh/keyboard-compatible behavior
+[✓] Implement screencast frame reading and state trajectory preparation from the specified directory
+[✓] Integrate an instruction-driven GPT-Sol reinforcement/control loop for keyboard and mouse actions
+[✓] Add tests/documentation and run end-to-end verification
+[0m
+Implemented the Rust computer-use pipeline.
+
+**Included**
+- Rust keyboard capture/injection modeled after `boppreh/keyboard`.
+- Keyboard listen, record, replay, press/release, and hotkey CLI commands.
+- Linux `evdev` timestamps, repeat events, scan-code support, and balanced stop-key recordings.
+- PNG/JPEG/WebP frame ingestion from a specified directory.
+- Bounded, modification-ordered frame trajectories with reused-path and incomplete-write detection.
+- OpenAI-compatible GPT-Sol vision policy using `OPENAI_API_KEY` and `OPENAI_BASE_URL`.
+- Typed mouse, key-tap, hotkey, scroll, wait, and completion actions.
+- JSONL transitions with progress-derived rewards for offline RL/evaluation.
+- Dry-run by default; desktop input requires explicit `--execute`.
+- Pre-execution validation and bounded action magnitudes.
+
+Example:
+
+```bash
+export OPENAI_API_KEY=...
+export OPENAI_BASE_URL=https://api.openai.com/v1
+
+computeruse agent \
+  --frames ./screencast-frames \
+  --instructions ./gui-steps.txt \
+  --trace ./trajectory.jsonl
+```
+
+Add `--execute` to inject approved actions.
+
+Keyboard examples:
+
+```bash
+computeruse keyboard-listen
+computeruse hotkey 'ctrl+shift+a'
+computeruse keyboard-record keys.json --stop-key escape
+computeruse keyboard-play keys.json --speed 2
+```
+
+Verification passed:
+
+- `cargo fmt --all -- --check`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo test --all-targets --all-features`: 19 tests passed
+- `cargo doc --no-deps`
+- CLI help smoke test
+
+Live `/dev/input`, `/dev/uinput`, screencast production, and GPT endpoint execution were not exercised because they require host permissions and credentials. The RL component is an online policy/evaluation loop with transition logging, not an in-process model trainer.
