@@ -1,7 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::str::FromStr;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -70,13 +69,6 @@ impl MouseEvent {
         match self {
             Self::Button { time, .. } | Self::Move { time, .. } | Self::Wheel { time, .. } => *time,
         }
-    }
-
-    pub(crate) fn now() -> f64 {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs_f64()
     }
 }
 

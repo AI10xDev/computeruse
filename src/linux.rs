@@ -4,7 +4,7 @@ use crate::{
 use evdev::uinput::VirtualDevice;
 use evdev::{
     AbsInfo, AbsoluteAxisCode, AttributeSet, Device, EventSummary, EventType, InputEvent, KeyCode,
-    RelativeAxisCode,
+    PropType, RelativeAxisCode, SynchronizationCode,
 };
 use std::io;
 use std::path::PathBuf;
@@ -162,13 +162,14 @@ impl KeyboardBackend for LinuxKeyboard {
 }
 
 pub struct Listener {
-    devices: Vec<(PathBuf, Device, AbsolutePosition)>,
+    devices: Vec<(PathBuf, Device, PointerState)>,
 }
 
 #[derive(Default)]
-struct AbsolutePosition {
+struct PointerState {
     x: Option<i32>,
     y: Option<i32>,
+    pending: Vec<MouseEvent>,
 }
 
 pub struct KeyboardListener {
@@ -239,7 +240,7 @@ impl Listener {
         for (path, device) in evdev::enumerate() {
             if is_mouse(&device) {
                 device.set_nonblocking(true)?;
-                devices.push((path, device, AbsolutePosition::default()));
+                devices.push((path, device, PointerState::default()));
             }
         }
         if devices.is_empty() {
@@ -274,23 +275,23 @@ impl Listener {
         mut cancelled: impl FnMut() -> bool,
     ) -> io::Result<()> {
         loop {
-            let mut had_event = false;
-            for (_, device, absolute_position) in &mut self.devices {
+            let mut batch = Vec::new();
+            for (_, device, state) in &mut self.devices {
                 match device.fetch_events() {
                     Ok(events) => {
                         for event in events {
-                            if let Some(event) =
-                                convert_event(event.destructure(), absolute_position)
-                            {
-                                had_event = true;
-                                if callback(event) {
-                                    return Ok(());
-                                }
-                            }
+                            batch.extend(convert_event(event, state));
                         }
                     }
                     Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
                     Err(error) => return Err(error),
+                }
+            }
+            batch.sort_by(|left, right| left.timestamp().total_cmp(&right.timestamp()));
+            let had_event = !batch.is_empty();
+            for event in batch {
+                if callback(event) {
+                    return Ok(());
                 }
             }
             // Drain events already queued in this polling pass before stopping.
@@ -305,16 +306,26 @@ impl Listener {
 }
 
 fn is_mouse(device: &Device) -> bool {
-    let has_left_button = device
-        .supported_keys()
-        .is_some_and(|keys| keys.contains(KeyCode::BTN_LEFT));
+    let has_pointer_button = device.supported_keys().is_some_and(|keys| {
+        [
+            KeyCode::BTN_LEFT,
+            KeyCode::BTN_RIGHT,
+            KeyCode::BTN_MIDDLE,
+            KeyCode::BTN_SIDE,
+            KeyCode::BTN_EXTRA,
+        ]
+        .iter()
+        .any(|key| keys.contains(*key))
+    });
     let has_relative_position = device.supported_relative_axes().is_some_and(|axes| {
         axes.contains(RelativeAxisCode::REL_X) && axes.contains(RelativeAxisCode::REL_Y)
     });
     let has_absolute_position = device.supported_absolute_axes().is_some_and(|axes| {
         axes.contains(AbsoluteAxisCode::ABS_X) && axes.contains(AbsoluteAxisCode::ABS_Y)
     });
-    has_left_button && (has_relative_position || has_absolute_position)
+    has_pointer_button
+        || (device.properties().contains(PropType::POINTER)
+            && (has_relative_position || has_absolute_position))
 }
 
 fn is_keyboard(device: &Device) -> bool {
@@ -353,66 +364,83 @@ fn convert_keyboard_event(event: InputEvent) -> Option<KeyboardEvent> {
     }
 }
 
-fn convert_event(
-    event: EventSummary,
-    absolute_position: &mut AbsolutePosition,
-) -> Option<MouseEvent> {
-    let time = MouseEvent::now();
-    match event {
-        EventSummary::Key(_, KeyCode::BTN_TOUCH, 0) => {
-            *absolute_position = AbsolutePosition::default();
-            None
+fn convert_event(event: InputEvent, state: &mut PointerState) -> Vec<MouseEvent> {
+    let time = event
+        .timestamp()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64();
+    match event.destructure() {
+        EventSummary::Synchronization(_, SynchronizationCode::SYN_REPORT, _) => {
+            return std::mem::take(&mut state.pending);
         }
-        EventSummary::Key(_, key, value) => Some(MouseEvent::Button {
-            button: key_button(key)?,
-            state: if value == 0 {
-                ButtonState::Up
-            } else {
-                ButtonState::Down
-            },
-            time,
-        }),
-        EventSummary::RelativeAxis(_, RelativeAxisCode::REL_X, value) => Some(MouseEvent::Move {
-            dx: value,
-            dy: 0,
-            time,
-        }),
-        EventSummary::RelativeAxis(_, RelativeAxisCode::REL_Y, value) => Some(MouseEvent::Move {
-            dx: 0,
-            dy: value,
-            time,
-        }),
+        EventSummary::Synchronization(_, SynchronizationCode::SYN_DROPPED, _) => {
+            *state = PointerState::default();
+        }
+        EventSummary::Key(_, KeyCode::BTN_TOUCH, 0) => {
+            state.x = None;
+            state.y = None;
+        }
+        EventSummary::Key(_, key, value) => {
+            if let Some(button) = key_button(key) {
+                state.pending.push(MouseEvent::Button {
+                    button,
+                    state: if value == 0 {
+                        ButtonState::Up
+                    } else {
+                        ButtonState::Down
+                    },
+                    time,
+                });
+            }
+        }
+        EventSummary::RelativeAxis(_, RelativeAxisCode::REL_X, value) => {
+            push_movement(&mut state.pending, value, 0, time);
+        }
+        EventSummary::RelativeAxis(_, RelativeAxisCode::REL_Y, value) => {
+            push_movement(&mut state.pending, 0, value, time);
+        }
         EventSummary::RelativeAxis(_, RelativeAxisCode::REL_WHEEL, delta) => {
-            Some(MouseEvent::Wheel {
+            state.pending.push(MouseEvent::Wheel {
                 delta,
                 horizontal: false,
                 time,
-            })
+            });
         }
         EventSummary::RelativeAxis(_, RelativeAxisCode::REL_HWHEEL, delta) => {
-            Some(MouseEvent::Wheel {
+            state.pending.push(MouseEvent::Wheel {
                 delta,
                 horizontal: true,
                 time,
-            })
+            });
         }
         EventSummary::AbsoluteAxis(_, AbsoluteAxisCode::ABS_X, value) => {
-            let previous = absolute_position.x.replace(value)?;
-            Some(MouseEvent::Move {
-                dx: value - previous,
-                dy: 0,
-                time,
-            })
+            if let Some(previous) = state.x.replace(value) {
+                push_movement(&mut state.pending, value - previous, 0, time);
+            }
         }
         EventSummary::AbsoluteAxis(_, AbsoluteAxisCode::ABS_Y, value) => {
-            let previous = absolute_position.y.replace(value)?;
-            Some(MouseEvent::Move {
-                dx: 0,
-                dy: value - previous,
-                time,
-            })
+            if let Some(previous) = state.y.replace(value) {
+                push_movement(&mut state.pending, 0, value - previous, time);
+            }
         }
-        _ => None,
+        _ => {}
+    }
+    Vec::new()
+}
+
+fn push_movement(events: &mut Vec<MouseEvent>, dx: i32, dy: i32, time: f64) {
+    if let Some(MouseEvent::Move {
+        dx: pending_dx,
+        dy: pending_dy,
+        time: pending_time,
+    }) = events.last_mut()
+    {
+        *pending_dx += dx;
+        *pending_dy += dy;
+        *pending_time = time;
+    } else {
+        events.push(MouseEvent::Move { dx, dy, time });
     }
 }
 
@@ -444,46 +472,66 @@ mod tests {
 
     #[test]
     fn converts_linux_button_events() {
+        let mut state = PointerState::default();
         let event = InputEvent::new(evdev::EventType::KEY.0, KeyCode::BTN_RIGHT.0, 1);
+        assert!(convert_event(event, &mut state).is_empty());
         assert!(matches!(
-            convert_event(event.destructure(), &mut AbsolutePosition::default()),
-            Some(MouseEvent::Button {
+            flush(&mut state).as_slice(),
+            [MouseEvent::Button {
                 button: Button::Right,
                 state: ButtonState::Down,
                 ..
-            })
+            }]
         ));
     }
 
     #[test]
     fn ignores_unknown_linux_events() {
         let event = InputEvent::new(evdev::EventType::SYNCHRONIZATION.0, 0, 0);
-        assert!(convert_event(event.destructure(), &mut AbsolutePosition::default()).is_none());
+        assert!(convert_event(event, &mut PointerState::default()).is_empty());
     }
 
     #[test]
-    fn converts_absolute_pointer_events_to_relative_movement() {
-        let mut position = AbsolutePosition::default();
-        let first = InputEvent::new(evdev::EventType::ABSOLUTE.0, AbsoluteAxisCode::ABS_X.0, 100);
-        let second = InputEvent::new(evdev::EventType::ABSOLUTE.0, AbsoluteAxisCode::ABS_X.0, 125);
-
-        assert!(convert_event(first.destructure(), &mut position).is_none());
+    fn combines_pointer_axes_in_one_replay_event() {
+        let mut state = PointerState::default();
+        for event in [
+            InputEvent::new(evdev::EventType::RELATIVE.0, RelativeAxisCode::REL_X.0, 25),
+            InputEvent::new(evdev::EventType::RELATIVE.0, RelativeAxisCode::REL_Y.0, -10),
+        ] {
+            assert!(convert_event(event, &mut state).is_empty());
+        }
         assert!(matches!(
-            convert_event(second.destructure(), &mut position),
-            Some(MouseEvent::Move { dx: 25, dy: 0, .. })
+            flush(&mut state).as_slice(),
+            [MouseEvent::Move {
+                dx: 25,
+                dy: -10,
+                ..
+            }]
         ));
     }
 
     #[test]
     fn touch_release_resets_absolute_pointer_position() {
-        let mut position = AbsolutePosition {
+        let mut state = PointerState {
             x: Some(100),
             y: Some(200),
+            pending: Vec::new(),
         };
         let release = InputEvent::new(evdev::EventType::KEY.0, KeyCode::BTN_TOUCH.0, 0);
-        assert!(convert_event(release.destructure(), &mut position).is_none());
-        assert_eq!(position.x, None);
-        assert_eq!(position.y, None);
+        assert!(convert_event(release, &mut state).is_empty());
+        assert_eq!(state.x, None);
+        assert_eq!(state.y, None);
+    }
+
+    fn flush(state: &mut PointerState) -> Vec<MouseEvent> {
+        convert_event(
+            InputEvent::new(
+                evdev::EventType::SYNCHRONIZATION.0,
+                SynchronizationCode::SYN_REPORT.0,
+                0,
+            ),
+            state,
+        )
     }
 
     #[test]
