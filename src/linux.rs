@@ -258,7 +258,19 @@ impl Listener {
 
     /// Listens until the callback returns `true`.
     pub fn listen_until(&mut self, mut callback: impl FnMut(MouseEvent) -> bool) -> io::Result<()> {
+        self.listen_until_cancelled(&mut callback, || false)
+    }
+
+    /// Listens until the callback or cancellation predicate returns `true`.
+    pub fn listen_until_cancelled(
+        &mut self,
+        mut callback: impl FnMut(MouseEvent) -> bool,
+        mut cancelled: impl FnMut() -> bool,
+    ) -> io::Result<()> {
         loop {
+            if cancelled() {
+                return Ok(());
+            }
             let mut had_event = false;
             for (_, device) in &mut self.devices {
                 match device.fetch_events() {
@@ -266,7 +278,7 @@ impl Listener {
                         for event in events {
                             if let Some(event) = convert_event(event.destructure()) {
                                 had_event = true;
-                                if callback(event) {
+                                if callback(event) || cancelled() {
                                     return Ok(());
                                 }
                             }

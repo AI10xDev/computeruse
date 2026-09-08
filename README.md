@@ -80,8 +80,8 @@ computeruse move-to 32768 32768
 # Print newline-delimited JSON events until interrupted.
 computeruse listen
 
-# Home the pointer to (0, 0), record through the first right-button press,
-# then home it again and replay twice as fast.
+# Home the pointer to (0, 0), record until Escape is pressed, then home it
+# again and replay twice as fast.
 computeruse record session.json
 computeruse play session.json --speed 2
 
@@ -98,9 +98,9 @@ computeruse keyboard-play keys.json --speed 2
 Before capture starts, the `record` command moves the pointer to normalized
 desktop coordinate `(0, 0)`, making that position the origin for the recorded
 relative movement. The `play` command returns the pointer to the same origin
-before replaying events. Recordings include the stop event in the file,
-matching the behavior of the original Python package. Use `--stop-button
-middle` to select another button. A speed of `0` replays events without delays.
+before replaying events. Press Escape to stop recording. The Escape event is
+not included because mouse recordings contain only mouse events. A speed of `0`
+replays events without delays.
 
 ## Library
 

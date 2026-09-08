@@ -9,8 +9,11 @@ use serde::Serialize;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, BufWriter, Write};
 use std::path::PathBuf;
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+const ESCAPE_SCAN_CODE: u16 = 1;
 
 #[derive(Parser)]
 #[command(version, about)]
@@ -53,10 +56,9 @@ enum Command {
         horizontal: bool,
     },
     Listen,
+    /// Record mouse events until Escape is pressed.
     Record {
         output: PathBuf,
-        #[arg(long, default_value = "right")]
-        stop_button: Button,
     },
     Play {
         input: PathBuf,
@@ -125,10 +127,7 @@ fn main() -> Result<()> {
             Listener::new()?.listen(|event| println_json(&event))?;
             Ok(())
         }
-        Command::Record {
-            output,
-            stop_button,
-        } => record(output, stop_button),
+        Command::Record { output } => record(output),
         Command::KeyboardListen => {
             KeyboardListener::new()?.listen(|event| println_json(&event))?;
             Ok(())
@@ -486,10 +485,11 @@ fn append_json_line(path: &PathBuf, value: &impl Serialize) -> Result<()> {
     Ok(())
 }
 
-fn record(output: PathBuf, stop_button: Button) -> Result<()> {
+fn record(output: PathBuf) -> Result<()> {
     // Open physical devices before creating uinput devices so recording cannot
     // include events from the virtual mouse used for homing.
     let mut listener = Listener::new()?;
+    let mut keyboard = KeyboardListener::new()?;
     let mut mouse = Controller::new(
         LinuxMouse::new().context("cannot create uinput device; check /dev/uinput permissions")?,
     );
@@ -498,22 +498,40 @@ fn record(output: PathBuf, stop_button: Button) -> Result<()> {
         .context("cannot move mouse to the home position before recording")?;
 
     let mut events = Vec::new();
-    listener.listen_until(|event| {
-        let stopped = matches!(
-            event,
-            MouseEvent::Button {
-                button,
-                state: computeruse::ButtonState::Down,
-                ..
-            } if button == stop_button
-        );
-        events.push(event);
-        stopped
-    })?;
+    let (stop_sender, stop_receiver) = mpsc::sync_channel(1);
+    let keyboard_thread = thread::spawn(move || {
+        let result = keyboard.listen_until(|event| is_escape_press(&event));
+        let _ = stop_sender.send(result);
+    });
+    let mut keyboard_result = None;
+    listener.listen_until_cancelled(
+        |event| {
+            events.push(event);
+            false
+        },
+        || match stop_receiver.try_recv() {
+            Ok(result) => {
+                keyboard_result = Some(result);
+                true
+            }
+            Err(mpsc::TryRecvError::Empty) => false,
+            Err(mpsc::TryRecvError::Disconnected) => true,
+        },
+    )?;
+    keyboard_thread
+        .join()
+        .map_err(|_| anyhow::anyhow!("keyboard listener thread panicked"))?;
+    keyboard_result
+        .context("keyboard listener stopped unexpectedly")?
+        .context("cannot listen for Escape while recording")?;
     let file = File::create(&output)
         .with_context(|| format!("cannot create recording at {}", output.display()))?;
     serde_json::to_writer_pretty(BufWriter::new(file), &events)?;
     Ok(())
+}
+
+fn is_escape_press(event: &KeyboardEvent) -> bool {
+    event.key.scan_code == ESCAPE_SCAN_CODE && event.state == KeyState::Down && !event.repeat
 }
 
 fn println_json(event: &impl Serialize) {
@@ -572,5 +590,31 @@ mod tests {
             cli.command,
             Command::Agent { frame, .. } if frame == *"recording.mp4"
         ));
+    }
+
+    #[test]
+    fn record_only_requires_an_output_path() {
+        let cli = Cli::try_parse_from(["computeruse", "record", "session.json"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Record { output } if output == *"session.json"
+        ));
+    }
+
+    #[test]
+    fn escape_press_stops_mouse_recording() {
+        let mut event = KeyboardEvent {
+            key: Key::from_scan_code(ESCAPE_SCAN_CODE),
+            state: KeyState::Down,
+            repeat: false,
+            time: 0.0,
+        };
+        assert!(is_escape_press(&event));
+
+        event.repeat = true;
+        assert!(!is_escape_press(&event));
+        event.repeat = false;
+        event.state = KeyState::Up;
+        assert!(!is_escape_press(&event));
     }
 }
