@@ -99,9 +99,11 @@ computeruse keyboard-play keys.json --speed 2
 
 Before capture starts, the `record` command queries the pointer through X11 and
 moves it to screen 0 pixel `(960, 540)`, making that position the origin for the
-recorded relative movement. The `play` command repeats and verifies the same
-calibration before replaying events. Both commands print the before and after
-locations in `xdotool getmouselocation` format. Press Escape to stop recording.
+recorded relative movement. Mouse buttons are captured through XInput2 so both
+physical clicks and libinput touchpad tap-to-click gestures are retained. The
+`play` command repeats and verifies the same calibration before replaying events.
+Both commands print the before and after locations in `xdotool getmouselocation`
+format. Press Escape to stop recording.
 The Escape event is not included because mouse recordings contain only mouse
 events. A speed of `0` replays events without delays.
 

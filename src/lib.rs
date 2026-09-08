@@ -29,4 +29,4 @@ pub use video::extract_video_frames;
 #[cfg(target_os = "linux")]
 pub use linux::{KeyboardListener, LinuxKeyboard, LinuxMouse, Listener};
 #[cfg(target_os = "linux")]
-pub use x11::{CursorLocation, X11Cursor};
+pub use x11::{CursorLocation, X11ButtonListener, X11Cursor};

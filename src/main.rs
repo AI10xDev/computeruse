@@ -3,14 +3,15 @@ use clap::{Parser, Subcommand};
 use computeruse::{
     Action, Button, Controller, FrameSequence, GptAstraPolicy, Key, KeyState, KeyboardController,
     KeyboardEvent, KeyboardListener, KeyboardPlaybackFilter, LinuxKeyboard, LinuxMouse, Listener,
-    MouseEvent, MouseTrajectory, PlaybackFilter, Point, Policy, Transition, X11Cursor,
-    extract_video_frames,
+    MouseEvent, MouseTrajectory, PlaybackFilter, Point, Policy, Transition, X11ButtonListener,
+    X11Cursor, extract_video_frames,
 };
 use serde::Serialize;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, BufWriter, Write};
 use std::path::PathBuf;
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -492,18 +493,35 @@ fn append_json_line(path: &PathBuf, value: &impl Serialize) -> Result<()> {
 fn record(output: PathBuf) -> Result<()> {
     let mut listener = Listener::new()?;
     let mut keyboard = KeyboardListener::new()?;
+    let button_listener = X11ButtonListener::connect(HOME_SCREEN)
+        .context("cannot initialize XInput button recording")?;
     calibrate_cursor("recording")?;
 
     let mut events = Vec::new();
+    let stop_buttons = Arc::new(AtomicBool::new(false));
+    let button_stop = Arc::clone(&stop_buttons);
+    let button_thread = thread::spawn(move || {
+        let mut events = Vec::new();
+        let result = button_listener.listen_until_cancelled(
+            |event| {
+                events.push(event);
+                false
+            },
+            || button_stop.load(Ordering::Acquire),
+        );
+        (events, result)
+    });
     let (stop_sender, stop_receiver) = mpsc::sync_channel(1);
     let keyboard_thread = thread::spawn(move || {
         let result = keyboard.listen_until(|event| is_escape_press(&event));
         let _ = stop_sender.send(result);
     });
     let mut keyboard_result = None;
-    listener.listen_until_cancelled(
+    let listener_result = listener.listen_until_cancelled(
         |event| {
-            events.push(event);
+            if !matches!(event, MouseEvent::Button { .. }) {
+                events.push(event);
+            }
             false
         },
         || match stop_receiver.try_recv() {
@@ -514,13 +532,21 @@ fn record(output: PathBuf) -> Result<()> {
             Err(mpsc::TryRecvError::Empty) => false,
             Err(mpsc::TryRecvError::Disconnected) => true,
         },
-    )?;
+    );
+    stop_buttons.store(true, Ordering::Release);
     keyboard_thread
         .join()
         .map_err(|_| anyhow::anyhow!("keyboard listener thread panicked"))?;
     keyboard_result
         .context("keyboard listener stopped unexpectedly")?
         .context("cannot listen for Escape while recording")?;
+    let (button_events, button_result) = button_thread
+        .join()
+        .map_err(|_| anyhow::anyhow!("XInput button listener thread panicked"))?;
+    listener_result.context("cannot record mouse movement")?;
+    button_result.context("cannot record XInput button events")?;
+    events.extend(button_events);
+    events.sort_by(|left, right| left.timestamp().total_cmp(&right.timestamp()));
     MouseTrajectory::from_events(home_point(), &events)
         .context("recorded mouse trajectory exceeds the coordinate range")?;
     let file = File::create(&output)
