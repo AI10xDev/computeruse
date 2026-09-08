@@ -1,4 +1,4 @@
-# Migrating From `boppreh/mouse`
+# Migrating From `boppreh/mouse` And `boppreh/keyboard`
 
 This project preserves the intent and major operations of the Python package,
 but it is not a drop-in Python API replacement.
@@ -15,6 +15,18 @@ but it is not a drop-in Python API replacement.
 | `hook(callback)` | `Listener::listen` | `listen` |
 | `record()` | `Listener::listen_until` | `record FILE` |
 | `play(events)` | `Controller::play` | `play FILE` |
+
+Keyboard equivalents use `KeyboardController`, `KeyboardListener`, and the
+`keyboard-*` CLI commands:
+
+| Python operation | Rust library | CLI |
+| --- | --- | --- |
+| `press(key)` | `KeyboardController::press` | `key-press KEY` |
+| `release(key)` | `KeyboardController::release` | `key-release KEY` |
+| `send(hotkey)` | `KeyboardController::send_hotkey` | `hotkey KEYS` |
+| `hook(callback)` | `KeyboardListener::listen` | `keyboard-listen` |
+| `record()` | `KeyboardListener::listen_until` | `keyboard-record FILE` |
+| `play(events)` | `KeyboardController::play` | `keyboard-play FILE` |
 
 ## Intentional Changes
 
@@ -33,8 +45,12 @@ but it is not a drop-in Python API replacement.
   and distance.
 - Permissions are reported as I/O errors rather than requiring the process to
   run as root. ACLs or a narrowly scoped group are recommended.
+- Keyboard key names cover common US-layout keys and modifiers. Any supported
+  Linux key can be addressed losslessly as `code:<scan-code>`. Layout-aware
+  Unicode text composition, suppression, abbreviations, and hidden global
+  callback threads from the Python package are intentionally not reproduced.
 
-## Recording Format
+## Mouse Recording Format
 
 Recordings are JSON arrays. Each event has a `type` discriminator and Unix
 timestamp in fractional seconds:
@@ -46,3 +62,25 @@ timestamp in fractional seconds:
   {"type":"button","button":"left","state":"up","time":1788874200.3}
 ]
 ```
+
+Keyboard recordings are also JSON arrays, but use a keyboard-specific schema:
+
+```json
+[
+  {
+    "key":{"name":"a","scan_code":30},
+    "state":"down",
+    "repeat":false,
+    "time":1788874200.1
+  },
+  {
+    "key":{"name":"a","scan_code":30},
+    "state":"up",
+    "repeat":false,
+    "time":1788874200.2
+  }
+]
+```
+
+`keyboard-record` stops after the stop key is released, so its recording
+contains a balanced down/up pair.

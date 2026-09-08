@@ -1,9 +1,10 @@
 # computeruse
 
-`computeruse` is a Rust library and command-line tool for global mouse capture
-and control on Ubuntu. It is a Linux-focused refactor of
-[`boppreh/mouse`](https://github.com/boppreh/mouse) that uses the kernel's
-`evdev` and `uinput` interfaces instead of Python and X11.
+`computeruse` is a Rust library and command-line tool for global mouse and
+keyboard capture and control on Ubuntu. It is a Linux-focused refactor of
+[`boppreh/mouse`](https://github.com/boppreh/mouse) and
+[`boppreh/keyboard`](https://github.com/boppreh/keyboard) that uses the
+kernel's `evdev` and `uinput` interfaces instead of Python and X11.
 
 The kernel interfaces work in both Xorg and Wayland sessions and are suitable
 for Ubuntu 26.04. No display-server-specific automation API is required.
@@ -14,6 +15,9 @@ for Ubuntu 26.04. No display-server-specific automation API is required.
 - Inject clicks, button presses, movement, scrolling, and drag operations.
 - Move to normalized absolute coordinates through a virtual absolute pointer.
 - Record events as portable JSON and replay them with timing and type filters.
+- Hook, record, replay, and inject keyboard keys and simultaneous hotkeys.
+- Read ordered screencast frames and retain a bounded visual state trajectory.
+- Use an OpenAI-compatible gpt-Astra vision policy to propose or execute GUI actions.
 - Use the same functionality from the CLI or the Rust library.
 - Test high-level behavior without access to physical input hardware.
 
@@ -44,6 +48,8 @@ trusted users and services.
 
 ## Install
 
+For a short setup walkthrough, see [`QUICKSTART.md`](QUICKSTART.md).
+
 ```bash
 cargo install --git https://github.com/AI10xDev/computeruse
 ```
@@ -73,17 +79,27 @@ computeruse move-to 32768 32768
 # Print newline-delimited JSON events until interrupted.
 computeruse listen
 
-# Record through the first right-button press, then replay twice as fast.
+# Home the pointer to (0, 0), record through the first right-button press,
+# then home it again and replay twice as fast.
 computeruse record session.json
 computeruse play session.json --speed 2
 
 # Replay only movement and wheel events.
 computeruse play session.json --no-buttons
+
+# Hook, send, record, and replay keyboard events.
+computeruse keyboard-listen
+computeruse hotkey 'ctrl+shift+a'
+computeruse keyboard-record keys.json --stop-key escape
+computeruse keyboard-play keys.json --speed 2
 ```
 
-The `record` command includes the stop event in the file, matching the behavior
-of the original Python package. Use `--stop-button middle` to select another
-button. A speed of `0` replays events without delays.
+Before capture starts, the `record` command moves the pointer to normalized
+desktop coordinate `(0, 0)`, making that position the origin for the recorded
+relative movement. The `play` command returns the pointer to the same origin
+before replaying events. Recordings include the stop event in the file,
+matching the behavior of the original Python package. Use `--stop-button
+middle` to select another button. A speed of `0` replays events without delays.
 
 ## Library
 
@@ -111,6 +127,55 @@ fn main() -> std::io::Result<()> {
 
 `Controller<B>` is generic over `MouseBackend`, allowing applications to use a
 fake backend in unit tests without opening `/dev/uinput`.
+
+`KeyboardController<B>` provides the equivalent keyboard abstraction. Key
+recordings retain the Linux scan code, normalized key name, up/down state,
+repeat marker, and timestamp. Hotkeys press keys in the listed order and
+release them in reverse order, matching `boppreh/keyboard` behavior.
+
+## Visual Agent
+
+The `agent` command watches a screencast frame directory and evaluates GUI
+instructions from a text file. PNG, JPEG, and WebP files are ordered by
+modification time. Each policy call receives the latest bounded frame
+trajectory and prior transitions, then emits typed mouse, keyboard, scroll, or
+wait actions. The transition log includes the policy's progress estimate and
+its change as a reward signal for evaluation or offline reinforcement learning.
+Frame producers should write to a temporary name and atomically rename the
+finished image into the watched directory. Rewritten paths are detected from
+their size and modification time, and reads that change while in progress are
+deferred.
+
+Set an API key and optionally an OpenAI-compatible endpoint:
+
+```bash
+export OPENAI_API_KEY=...
+export OPENAI_BASE_URL=https://api.openai.com/v1
+
+# Safe default: inspect decisions as JSONL without injecting input.
+computeruse agent \
+  --frames ./screencast-frames \
+  --instructions ./gui-steps.txt \
+  --trace ./trajectory.jsonl
+
+# Explicitly allow model-selected mouse and keyboard input.
+computeruse agent \
+  --frames ./screencast-frames \
+  --instructions ./gui-steps.txt \
+  --execute
+```
+
+The default model is `gpt-Astra`; override it with `--model` for the name
+exposed by your endpoint. On the first step the source uses only the newest
+trajectory window, so stale frames are not replayed. After an action it waits
+for a new frame. `--execute` is deliberately required for input injection.
+Policy actions are atomic key taps/hotkeys and mouse clicks rather than
+persistent holds. Each decision is limited to 16 actions, relative movement to
+32767 units per axis, scrolling to 100 units, and waits to 30 seconds.
+
+This is an online visual policy/evaluation loop, not an in-process model
+trainer. The `Policy` trait and JSONL transitions are the integration points
+for a separate RL trainer or replay buffer.
 
 ## Wayland And Coordinates
 

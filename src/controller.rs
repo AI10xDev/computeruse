@@ -47,6 +47,11 @@ impl<B: MouseBackend> Controller<B> {
         self.backend.move_absolute(x, y)
     }
 
+    /// Moves to the normalized desktop origin at the upper-left corner.
+    pub fn home(&mut self) -> Result<(), B::Error> {
+        self.move_absolute(0, 0)
+    }
+
     pub fn wheel(&mut self, delta: i32) -> Result<(), B::Error> {
         self.backend.wheel(delta, false)
     }
@@ -198,6 +203,13 @@ mod tests {
             )
         });
         assert_eq!(totals, (7, -5));
+    }
+
+    #[test]
+    fn home_moves_to_absolute_origin() {
+        let mut controller = Controller::new(FakeBackend::default());
+        controller.home().unwrap();
+        assert_eq!(controller.backend.0, ["absolute:0,0"]);
     }
 
     #[test]

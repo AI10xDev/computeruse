@@ -1,4 +1,6 @@
-use crate::{Button, ButtonState, MouseBackend, MouseEvent};
+use crate::{
+    Button, ButtonState, Key, KeyState, KeyboardBackend, KeyboardEvent, MouseBackend, MouseEvent,
+};
 use evdev::uinput::VirtualDevice;
 use evdev::{
     AbsInfo, AbsoluteAxisCode, AttributeSet, Device, EventSummary, EventType, InputEvent, KeyCode,
@@ -106,8 +108,123 @@ impl MouseBackend for LinuxMouse {
     }
 }
 
+pub struct LinuxKeyboard {
+    device: VirtualDevice,
+}
+
+impl LinuxKeyboard {
+    pub fn new() -> io::Result<Self> {
+        let mut keys = AttributeSet::<KeyCode>::new();
+        for code in 1..=0x2ff {
+            if is_keyboard_code(code) {
+                keys.insert(KeyCode::new(code));
+            }
+        }
+        let device = VirtualDevice::builder()?
+            .name("computeruse virtual keyboard")
+            .with_keys(&keys)?
+            .build()?;
+        Ok(Self { device })
+    }
+
+    pub fn supports_scan_code(scan_code: u16) -> bool {
+        is_keyboard_code(scan_code)
+    }
+}
+
+impl KeyboardBackend for LinuxKeyboard {
+    type Error = io::Error;
+
+    fn key(&mut self, scan_code: u16, state: KeyState) -> Result<(), Self::Error> {
+        if !is_keyboard_code(scan_code) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("scan code {scan_code} is not a supported Linux keyboard key"),
+            ));
+        }
+        self.device.emit(&[InputEvent::new(
+            EventType::KEY.0,
+            scan_code,
+            i32::from(state == KeyState::Down),
+        )])
+    }
+
+    fn repeat(&mut self, scan_code: u16) -> Result<(), Self::Error> {
+        if !is_keyboard_code(scan_code) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("scan code {scan_code} is not a supported Linux keyboard key"),
+            ));
+        }
+        self.device
+            .emit(&[InputEvent::new(EventType::KEY.0, scan_code, 2)])
+    }
+}
+
 pub struct Listener {
     devices: Vec<(PathBuf, Device)>,
+}
+
+pub struct KeyboardListener {
+    devices: Vec<(PathBuf, Device)>,
+}
+
+impl KeyboardListener {
+    pub fn new() -> io::Result<Self> {
+        let mut devices = Vec::new();
+        for (path, device) in evdev::enumerate() {
+            if is_keyboard(&device) {
+                device.set_nonblocking(true)?;
+                devices.push((path, device));
+            }
+        }
+        if devices.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "no readable keyboard devices found under /dev/input; check permissions",
+            ));
+        }
+        Ok(Self { devices })
+    }
+
+    pub fn device_paths(&self) -> impl Iterator<Item = &PathBuf> {
+        self.devices.iter().map(|(path, _)| path)
+    }
+
+    pub fn listen(mut self, mut callback: impl FnMut(KeyboardEvent)) -> io::Result<()> {
+        self.listen_until(|event| {
+            callback(event);
+            false
+        })
+    }
+
+    pub fn listen_until(
+        &mut self,
+        mut callback: impl FnMut(KeyboardEvent) -> bool,
+    ) -> io::Result<()> {
+        loop {
+            let mut had_event = false;
+            for (_, device) in &mut self.devices {
+                match device.fetch_events() {
+                    Ok(events) => {
+                        for event in events {
+                            if let Some(event) = convert_keyboard_event(event) {
+                                had_event = true;
+                                if callback(event) {
+                                    return Ok(());
+                                }
+                            }
+                        }
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            if !had_event {
+                thread::sleep(Duration::from_millis(2));
+            }
+        }
+    }
 }
 
 impl Listener {
@@ -171,6 +288,42 @@ fn is_mouse(device: &Device) -> bool {
         keys.contains(KeyCode::BTN_LEFT)
             && (keys.contains(KeyCode::BTN_RIGHT) || keys.contains(KeyCode::BTN_MIDDLE))
     })
+}
+
+fn is_keyboard(device: &Device) -> bool {
+    device.supported_keys().is_some_and(|keys| {
+        keys.contains(KeyCode::KEY_A)
+            && keys.contains(KeyCode::KEY_Z)
+            && keys.contains(KeyCode::KEY_ENTER)
+            && keys.contains(KeyCode::KEY_SPACE)
+    })
+}
+
+fn is_keyboard_code(code: u16) -> bool {
+    (1..=0x2ff).contains(&code) && !(0x100..=0x15f).contains(&code)
+}
+
+fn convert_keyboard_event(event: InputEvent) -> Option<KeyboardEvent> {
+    let time = event
+        .timestamp()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64();
+    match event.destructure() {
+        EventSummary::Key(_, key, value) if is_keyboard_code(key.code()) && value >= 0 => {
+            Some(KeyboardEvent {
+                key: Key::from_scan_code(key.code()),
+                state: if value == 0 {
+                    KeyState::Up
+                } else {
+                    KeyState::Down
+                },
+                repeat: value == 2,
+                time,
+            })
+        }
+        _ => None,
+    }
 }
 
 fn convert_event(event: EventSummary) -> Option<MouseEvent> {
@@ -256,5 +409,19 @@ mod tests {
     fn ignores_unknown_linux_events() {
         let event = InputEvent::new(evdev::EventType::SYNCHRONIZATION.0, 0, 0);
         assert!(convert_event(event.destructure()).is_none());
+    }
+
+    #[test]
+    fn converts_linux_keyboard_events_and_repeats() {
+        let event = InputEvent::new(evdev::EventType::KEY.0, KeyCode::KEY_A.0, 2);
+        assert!(matches!(
+            convert_keyboard_event(event),
+            Some(KeyboardEvent {
+                key: Key { scan_code: 30, .. },
+                state: KeyState::Down,
+                repeat: true,
+                ..
+            })
+        ));
     }
 }
