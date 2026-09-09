@@ -273,6 +273,10 @@ pub struct Transition {
     pub reward: f32,
     pub completed: bool,
     pub executed: bool,
+    /// One measured report per controlled mouse_move_to, in action order.
+    /// Empty for dry runs or unverified direct movement.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub cursor_motion: Vec<crate::CursorMotion>,
 }
 
 pub trait Policy {
@@ -350,7 +354,7 @@ fn azure_responses_endpoint(endpoint: &str) -> String {
         .split('&')
         .filter(|parameter| {
             let key = parameter.split_once('=').map_or(*parameter, |(key, _)| key);
-            !parameter.is_empty() && !(is_v1_endpoint && key == "api-version")
+            !(parameter.is_empty() || is_v1_endpoint && key == "api-version")
         })
         .collect::<Vec<_>>()
         .join("&");
@@ -393,14 +397,18 @@ impl Policy for GptAstraPolicy {
             "Only the newest frame represents the current state; earlier frames are historical. ",
             "Previous transitions with executed=true record actions already sent, not instructions to replay. ",
             "Do not retype executed keys just because visual feedback is delayed; wait for a fresh observation before correcting input. ",
-            "Use normalized 0..65535 coordinates for mouse_move_to. Prefer one small, reversible action per observation for navigation. ",
+            "Use mouse_move_to for precision targets. Its coordinates are normalized 0..65535, NOT screenshot pixels: x=round(pixel_x*65535/(width-1)), y=round(pixel_y*65535/(height-1)). ",
+            "mouse_move uses raw device counts, which are not screen pixels and can be affected by acceleration. ",
+            "When present, cursor_motion reports measured desktop pixels, residual error, and velocity in pixels/second. Cursor arrival does not prove a click or page change succeeded. ",
+            "Prefer one small, reversible action per observation for navigation; reduce scroll increments as the target approaches rather than repeating large scrolls. ",
             "For known text in a focused field, use key_sequence to batch typing in one decision instead of requesting a decision for every letter. ",
             "Each sequence entry is a named key or hotkey, tapped once in order without observation delays. Preserve intentional repeated letters. ",
             "For example, {\"type\":\"key_sequence\",\"keys\":[\"h\",\"e\",\"l\",\"l\",\"o\",\"dot\"]} types hello. on a matching keyboard layout. ",
+            "When the instructions explicitly request typing a known URL or query and pressing Enter, include enter as the final key in that same sequence; do not spend a separate observation on submission. ",
             "Observe focus changes before typing; do not combine navigation and speculative typing in one sequence. ",
             "Never invent an action type. Set completed only when the latest frame visibly proves the instructions are complete. ",
             "Output: {\"rationale\":string,\"actions\":[action],\"completed\":bool,\"progress\":number}. ",
-            "Every action must be a flat object with a required \"type\" field, for example {\"type\":\"mouse_move_to\",\"x\":1800,\"y\":800}; do not use {\"mouse_move_to\":{...}}. ",
+            "Every action must be a flat object with a required \"type\" field, for example {\"type\":\"mouse_move_to\",\"x\":32768,\"y\":32768} targets the desktop center; do not use {\"mouse_move_to\":{...}}. ",
             "Valid type/field sets: mouse_move(dx,dy), mouse_move_to(x,y), mouse_click(button), scroll(delta,horizontal), key_tap(key), hotkey(keys), key_sequence(keys), wait(milliseconds). ",
             "Buttons: left, right, middle, side, extra. Named keys and hotkeys use forms such as enter, tab, escape, ctrl+shift+a. ",
             "Use shift+a for an uppercase A. key_sequence.keys is an array of 1..256 key/hotkey strings; hotkey.keys is one string. ",

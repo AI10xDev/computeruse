@@ -1,8 +1,141 @@
-use crate::{Button, ButtonState, MouseEvent};
+use crate::{Button, ButtonState, CursorEstimate, MouseEvent, Point};
+use anyhow::{Result, ensure};
+use serde::Serialize;
 use std::thread;
 use std::time::{Duration, Instant};
 
 const CLICK_HOLD_DURATION: Duration = Duration::from_millis(20);
+const CURSOR_POLL_INTERVAL: Duration = Duration::from_millis(16);
+const CURSOR_TIMEOUT: Duration = Duration::from_secs(2);
+const CURSOR_TOLERANCE: f64 = 2.0;
+const MAX_CURSOR_STEP: f64 = 96.0;
+
+/// Observes and moves the cursor in the same desktop-pixel coordinate space.
+/// Unlike relative input counts, these coordinates must not depend on acceleration.
+pub trait CursorBackend {
+    fn dimensions(&mut self) -> Result<(u16, u16)>;
+    fn position(&mut self) -> Result<Point>;
+    fn move_to(&mut self, position: Point) -> Result<()>;
+}
+
+/// Measured result of one normalized target-directed movement. Positions and
+/// residuals are pixels; velocity is pixels/second, not relative input counts.
+#[derive(Clone, Debug, Serialize)]
+pub struct CursorMotion {
+    pub start: Point,
+    pub target: Point,
+    pub estimate: CursorEstimate,
+    pub corrections: usize,
+    pub elapsed_ms: f64,
+    pub residual_pixels: f64,
+    pub peak_speed_pixels_per_second: f64,
+}
+
+/// Proportionally approaches a normalized 0..=65535 target, with bounded pixel
+/// steps and short-horizon velocity damping. Requires two observations within
+/// two pixels of the target. The polling budget allows nominal travel time plus
+/// two seconds to settle. Backend calls must return promptly; this is not an I/O
+/// timeout. Errors prevent the caller from proceeding to a dependent click.
+pub fn move_cursor_to(cursor: &mut dyn CursorBackend, x: u16, y: u16) -> Result<CursorMotion> {
+    let started = Instant::now();
+    move_cursor_to_with_clock(cursor, x, y, |delay| {
+        thread::sleep(delay);
+        started.elapsed()
+    })
+}
+
+fn move_cursor_to_with_clock(
+    cursor: &mut dyn CursorBackend,
+    x: u16,
+    y: u16,
+    mut clock: impl FnMut(Duration) -> Duration,
+) -> Result<CursorMotion> {
+    let (width, height) = cursor.dimensions()?;
+    ensure!(
+        width > 0 && height > 0,
+        "cursor desktop dimensions must be nonzero"
+    );
+    let target = Point {
+        x: ((u32::from(x) * u32::from(width - 1) + 32_767) / 65_535) as i32,
+        y: ((u32::from(y) * u32::from(height - 1) + 32_767) / 65_535) as i32,
+    };
+    let start = cursor.position()?;
+    let started = clock(Duration::ZERO);
+    let distance =
+        (f64::from(target.x) - f64::from(start.x)).hypot(f64::from(target.y) - f64::from(start.y));
+    let budget = CURSOR_TIMEOUT + CURSOR_POLL_INTERVAL * (distance / MAX_CURSOR_STEP).ceil() as u32;
+    let mut now = started;
+    let mut estimate = CursorEstimate::new(start, now);
+    let mut corrections = 0;
+    let mut settled = 0;
+    let mut peak_speed: f64 = 0.0;
+
+    loop {
+        let position = estimate.position;
+        ensure!(
+            (0..i32::from(width)).contains(&position.x)
+                && (0..i32::from(height)).contains(&position.y),
+            "observed cursor ({}, {}) is outside the {width}x{height} desktop",
+            position.x,
+            position.y
+        );
+        let error = [
+            f64::from(target.x - position.x),
+            f64::from(target.y - position.y),
+        ];
+        let residual = error[0].hypot(error[1]);
+        ensure!(
+            now - started < budget,
+            "cursor did not settle at ({}, {}) within {} ms: observed ({}, {}), residual {residual:.2} pixels; remaining actions were not executed",
+            target.x,
+            target.y,
+            budget.as_millis(),
+            position.x,
+            position.y
+        );
+
+        if residual <= CURSOR_TOLERANCE {
+            settled += 1;
+            if settled == 2 {
+                return Ok(CursorMotion {
+                    start,
+                    target,
+                    estimate,
+                    corrections,
+                    elapsed_ms: (now - started).as_secs_f64() * 1000.0,
+                    residual_pixels: residual,
+                    peak_speed_pixels_per_second: peak_speed,
+                });
+            }
+        } else {
+            settled = 0;
+            let predicted = estimate.predict(CURSOR_POLL_INTERVAL);
+            // P control with velocity damping. Never command past the target or
+            // reverse away from it merely because the short prediction overshoots.
+            let mut step = [0.0; 2];
+            for axis in 0..2 {
+                let current = f64::from(if axis == 0 { position.x } else { position.y });
+                step[axis] = (0.5 * error[axis] - 0.15 * (predicted[axis] - current))
+                    .clamp(error[axis].min(0.0), error[axis].max(0.0));
+            }
+            let scale = (MAX_CURSOR_STEP / step[0].hypot(step[1])).min(1.0);
+            let next = Point {
+                x: position.x + (step[0] * scale) as i32,
+                y: position.y + (step[1] * scale) as i32,
+            };
+            if next != position {
+                cursor.move_to(next)?;
+                corrections += 1;
+            }
+        }
+
+        clock(CURSOR_POLL_INTERVAL);
+        let position = cursor.position()?;
+        now = clock(Duration::ZERO);
+        estimate.observe(position, now)?;
+        peak_speed = peak_speed.max(estimate.velocity[0].hypot(estimate.velocity[1]));
+    }
+}
 
 pub trait MouseBackend {
     type Error;
@@ -169,7 +302,171 @@ impl Default for PlaybackFilter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
     use std::convert::Infallible;
+
+    struct FakeCursor {
+        position: Point,
+        size: (u16, u16),
+        response: f64,
+        observations: VecDeque<Point>,
+        moves: Vec<(Point, Point)>,
+    }
+
+    impl FakeCursor {
+        fn new(position: Point, size: (u16, u16)) -> Self {
+            Self {
+                position,
+                size,
+                response: 1.0,
+                observations: VecDeque::new(),
+                moves: Vec::new(),
+            }
+        }
+    }
+
+    impl CursorBackend for FakeCursor {
+        fn dimensions(&mut self) -> Result<(u16, u16)> {
+            Ok(self.size)
+        }
+
+        fn position(&mut self) -> Result<Point> {
+            if let Some(position) = self.observations.pop_front() {
+                self.position = position;
+            }
+            Ok(self.position)
+        }
+
+        fn move_to(&mut self, target: Point) -> Result<()> {
+            self.moves.push((self.position, target));
+            self.position = Point {
+                x: self.position.x
+                    + (f64::from(target.x - self.position.x) * self.response).round() as i32,
+                y: self.position.y
+                    + (f64::from(target.y - self.position.y) * self.response).round() as i32,
+            };
+            Ok(())
+        }
+    }
+
+    fn simulate(cursor: &mut FakeCursor, x: u16, y: u16) -> Result<CursorMotion> {
+        let mut now = Duration::ZERO;
+        move_cursor_to_with_clock(cursor, x, y, |delay| {
+            now += delay;
+            now
+        })
+    }
+
+    #[test]
+    fn proportional_steps_are_bounded_and_shrink_near_the_target() {
+        let mut cursor = FakeCursor::new(Point { x: 0, y: 0 }, (1920, 1080));
+        let report = simulate(&mut cursor, 32_768, 32_768).unwrap();
+
+        assert_eq!(report.target, Point { x: 960, y: 540 });
+        assert!(report.residual_pixels <= CURSOR_TOLERANCE);
+        assert_eq!(report.estimate.position, cursor.position);
+        assert_eq!(report.estimate.velocity, [0.0, 0.0]);
+        assert!(report.peak_speed_pixels_per_second > 0.0);
+        assert_eq!(report.corrections, cursor.moves.len());
+        let lengths: Vec<_> = cursor
+            .moves
+            .iter()
+            .map(|(from, to)| f64::from(to.x - from.x).hypot(f64::from(to.y - from.y)))
+            .collect();
+        assert!(lengths.len() > 2);
+        assert!(lengths.iter().all(|length| *length <= MAX_CURSOR_STEP));
+        assert!(lengths.last().unwrap() < lengths.first().unwrap());
+    }
+
+    #[test]
+    fn normalized_targets_use_pixel_bounds_even_on_large_desktops() {
+        for (size, input, target) in [
+            ((1920, 1080), (0, 0), Point { x: 0, y: 0 }),
+            ((1920, 1080), (65_535, 65_535), Point { x: 1919, y: 1079 }),
+            ((3840, 2160), (32_768, 32_768), Point { x: 1920, y: 1080 }),
+            ((11520, 2160), (65_535, 65_535), Point { x: 11519, y: 2159 }),
+            ((1, 1), (65_535, 65_535), Point { x: 0, y: 0 }),
+        ] {
+            let mut cursor = FakeCursor::new(Point { x: 0, y: 0 }, size);
+            let report = simulate(&mut cursor, input.0, input.1).unwrap();
+            assert_eq!(report.target, target);
+            assert!(report.residual_pixels <= CURSOR_TOLERANCE);
+        }
+    }
+
+    #[test]
+    fn controller_corrects_observed_undertravel_instead_of_trusting_commands() {
+        let mut cursor = FakeCursor::new(Point { x: 50, y: 50 }, (1920, 1080));
+        cursor.response = 0.5;
+        let report = simulate(&mut cursor, 32_768, 32_768).unwrap();
+        assert!(report.residual_pixels <= CURSOR_TOLERANCE);
+        assert_eq!(report.estimate.position, cursor.position);
+        assert!(report.corrections > 15);
+    }
+
+    #[test]
+    fn delayed_and_overshooting_observations_require_consecutive_arrival_checks() {
+        let mut cursor = FakeCursor::new(Point { x: 0, y: 0 }, (201, 1));
+        cursor.observations = [
+            Point { x: 0, y: 0 },
+            Point { x: 0, y: 0 },
+            Point { x: 110, y: 0 },
+            Point { x: 100, y: 0 },
+            Point { x: 105, y: 0 },
+            Point { x: 100, y: 0 },
+            Point { x: 100, y: 0 },
+        ]
+        .into();
+        let report = simulate(&mut cursor, 32_768, 0).unwrap();
+
+        assert!(cursor.observations.is_empty());
+        assert_eq!(report.elapsed_ms, 96.0);
+        assert_eq!(report.residual_pixels, 0.0);
+        assert!(
+            cursor
+                .moves
+                .iter()
+                .any(|(from, to)| from.x == 110 && to.x < from.x)
+        );
+        assert!(
+            cursor
+                .moves
+                .iter()
+                .any(|(from, to)| from.x == 105 && to.x < from.x)
+        );
+    }
+
+    #[test]
+    fn already_arrived_cursor_is_observed_without_emitting_movement() {
+        let mut cursor = FakeCursor::new(Point { x: 960, y: 540 }, (1920, 1080));
+        let report = simulate(&mut cursor, 32_768, 32_768).unwrap();
+        assert!(cursor.moves.is_empty());
+        assert_eq!(report.elapsed_ms, 16.0);
+    }
+
+    #[test]
+    fn stuck_cursor_exhausts_a_bounded_budget_without_claiming_arrival() {
+        let mut cursor = FakeCursor::new(Point { x: 0, y: 0 }, (1920, 1080));
+        cursor.response = 0.0;
+        let error = simulate(&mut cursor, 32_768, 32_768).unwrap_err();
+        assert!(error.to_string().contains("did not settle"));
+        assert!(!cursor.moves.is_empty());
+        assert!(cursor.moves.len() < 150);
+    }
+
+    #[test]
+    fn invalid_cursor_geometry_or_observation_fails_before_movement() {
+        for (position, size) in [
+            (Point { x: 0, y: 0 }, (0, 1080)),
+            (Point { x: 0, y: 0 }, (1920, 0)),
+            (Point { x: -1, y: 0 }, (1920, 1080)),
+            (Point { x: 1920, y: 0 }, (1920, 1080)),
+        ] {
+            let mut cursor = FakeCursor::new(position, size);
+            assert!(simulate(&mut cursor, 32_768, 32_768).is_err());
+            assert!(cursor.moves.is_empty());
+        }
+    }
 
     #[derive(Default)]
     struct FakeBackend(Vec<String>);

@@ -1,1 +1,4 @@
-click on firefox and type realestate.com.au in the url bar
+click on firefox and type realestate.com.au in the url bar & hit enter
+go on the page and click on the rent button 
+click on the search bar and click onto "Any Location"
+Then click onto Filter and in the AI Search Beta  (type & search Sydney)

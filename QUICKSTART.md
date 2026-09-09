@@ -76,6 +76,23 @@ Start with dry-run mode. It prints JSON decisions but does not control input:
 The default model is `gpt-6-astra`. If your compatible endpoint exposes it under
 a different name, pass `--model NAME`.
 
-After reviewing the dry-run output, add `--execute` to allow the model-selected
-mouse and keyboard actions. Keep an emergency stop method available and only
-run trusted instructions.
+For execution, use live observations rather than the prerecorded video:
+
+```bash
+./record.sh ./new-recording.mp4 ./gui-steps.txt \
+  --execute \
+  --trace ./trajectory.jsonl
+```
+
+Precision mouse targets now use proportional movement with measured arrival
+checks by default. This requires native X11 and working `DISPLAY`/Xauthority.
+Xorg is detected through its `XFree86-DGA` extension even if XFCE inherits a
+stale `XDG_SESSION_TYPE=wayland` label; otherwise `XDG_SESSION_TYPE=x11` is
+required. Detected XWayland servers are rejected regardless of that variable.
+`--mouse-control direct` explicitly selects the previous
+unverified uinput behavior, including on Wayland. The trace includes measured
+`cursor_motion` reports when proportional movement executes. This does not remove
+model-request latency; known text and explicitly requested Enter submission can
+be batched into one `key_sequence`.
+
+Keep an emergency stop method available and only run trusted instructions.

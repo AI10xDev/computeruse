@@ -1,4 +1,4 @@
-use crate::{Button, ButtonState, MouseEvent};
+use crate::{Button, ButtonState, CursorBackend, MouseEvent, Point};
 use anyhow::{Context, Result, ensure};
 use std::fmt;
 use std::thread;
@@ -138,8 +138,18 @@ fn x11_button(detail: u32) -> Option<Button> {
 
 impl X11Cursor {
     pub fn connect(screen: usize) -> Result<Self> {
-        let (connection, _) =
+        Self::connect_screen(Some(screen))
+    }
+
+    /// Connects to the screen selected by DISPLAY rather than assuming screen 0.
+    pub fn connect_default() -> Result<Self> {
+        Self::connect_screen(None)
+    }
+
+    fn connect_screen(screen: Option<usize>) -> Result<Self> {
+        let (connection, default_screen) =
             x11rb::connect(None).context("cannot connect to X11; check DISPLAY and Xauthority")?;
+        let screen = screen.unwrap_or(default_screen);
         let root = connection
             .setup()
             .roots
@@ -151,6 +161,27 @@ impl X11Cursor {
             screen,
             root,
         })
+    }
+
+    /// Checks the connected server before enabling global proportional control.
+    pub fn require_native_x11(&self) -> Result<()> {
+        let extensions = self
+            .connection
+            .list_extensions()
+            .context("cannot request X11 extensions for session detection")?
+            .reply()
+            .context("cannot query X11 extensions for session detection")?;
+        let has_extension = |name: &[u8]| {
+            extensions
+                .names
+                .iter()
+                .any(|extension| extension.name == name)
+        };
+        validate_native_x11(
+            std::env::var("XDG_SESSION_TYPE").ok().as_deref(),
+            has_extension(b"XWAYLAND"),
+            has_extension(b"XFree86-DGA"),
+        )
     }
 
     /// X11 equivalent of `xdotool getmouselocation`.
@@ -190,15 +221,7 @@ impl X11Cursor {
             screen.width_in_pixels,
             screen.height_in_pixels
         );
-        self.connection
-            .warp_pointer(x11rb::NONE, self.root, 0, 0, 0, 0, x, y)
-            .context("cannot request X11 pointer warp")?
-            .check()
-            .context("X11 rejected pointer warp")?;
-        self.connection
-            .flush()
-            .context("cannot flush X11 pointer warp")?;
-
+        self.warp(x, y)?;
         let location = self.location()?;
         ensure!(
             location.x == x && location.y == y,
@@ -208,11 +231,121 @@ impl X11Cursor {
         );
         Ok(location)
     }
+
+    fn warp(&self, x: i16, y: i16) -> Result<()> {
+        self.connection
+            .warp_pointer(x11rb::NONE, self.root, 0, 0, 0, 0, x, y)
+            .context("cannot request X11 pointer warp")?
+            .check()
+            .context("X11 rejected pointer warp")?;
+        self.connection
+            .flush()
+            .context("cannot flush X11 pointer warp")
+    }
+}
+
+fn validate_native_x11(
+    session_type: Option<&str>,
+    xwayland: bool,
+    xfree86_dga: bool,
+) -> Result<()> {
+    ensure!(
+        !xwayland,
+        "proportional cursor control requires native X11, but DISPLAY points to XWayland; --mouse-control direct opts into unverified uinput movement without global cursor feedback"
+    );
+    // Xorg registers XFree86-DGA; Xwayland does not. Absence of the newer
+    // XWAYLAND extension alone is not enough to identify native X11.
+    ensure!(
+        xfree86_dga || session_type == Some("x11"),
+        "cannot verify native X11 for proportional cursor control: XDG_SESSION_TYPE={}, and DISPLAY does not advertise XFree86-DGA; if this display is confirmed to be native Xorg, rerun with XDG_SESSION_TYPE=x11; otherwise --mouse-control direct opts into unverified uinput movement",
+        session_type.unwrap_or("<unset>")
+    );
+    Ok(())
+}
+
+impl CursorBackend for X11Cursor {
+    fn dimensions(&mut self) -> Result<(u16, u16)> {
+        let geometry = self.connection.get_geometry(self.root)?.reply()?;
+        ensure!(
+            geometry.width > 0
+                && geometry.height > 0
+                && geometry.width <= 32_768
+                && geometry.height <= 32_768,
+            "X11 desktop dimensions exceed the supported pointer coordinate range"
+        );
+        Ok((geometry.width, geometry.height))
+    }
+
+    fn position(&mut self) -> Result<Point> {
+        let location = self.location()?;
+        Ok(Point {
+            x: i32::from(location.x),
+            y: i32::from(location.y),
+        })
+    }
+
+    fn move_to(&mut self, position: Point) -> Result<()> {
+        self.warp(
+            position
+                .x
+                .try_into()
+                .context("cursor x exceeds X11 coordinate range")?,
+            position
+                .y
+                .try_into()
+                .context("cursor y exceeds X11 coordinate range")?,
+        )
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_x11_detection_handles_stale_and_missing_session_metadata() {
+        for session_type in [Some("x11"), Some("wayland"), Some("tty"), Some(""), None] {
+            for (xwayland, xfree86_dga) in
+                [(false, false), (false, true), (true, false), (true, true)]
+            {
+                let result = validate_native_x11(session_type, xwayland, xfree86_dga);
+                assert_eq!(
+                    result.is_ok(),
+                    !xwayland && (xfree86_dga || session_type == Some("x11")),
+                    "session={session_type:?}, XWAYLAND={xwayland}, XFree86-DGA={xfree86_dga}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unverified_session_errors_report_the_session_value_and_remedy() {
+        for session_type in [Some("wayland"), None] {
+            let error = validate_native_x11(session_type, false, false)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(&format!(
+                "XDG_SESSION_TYPE={}",
+                session_type.unwrap_or("<unset>")
+            )));
+            assert!(error.contains("confirmed to be native Xorg"));
+            assert!(error.contains("--mouse-control direct"));
+        }
+        let error = validate_native_x11(Some("x11"), true, false)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("DISPLAY points to XWayland"));
+    }
+
+    #[test]
+    #[ignore = "requires a native X11 desktop with working DISPLAY and Xauthority"]
+    fn native_x11_preflight_reads_display_without_injecting_input() {
+        let mut cursor = X11Cursor::connect_default().unwrap();
+        cursor.require_native_x11().unwrap();
+        let (width, height) = cursor.dimensions().unwrap();
+        let position = cursor.position().unwrap();
+        eprintln!("native X11 preflight: {width}x{height}, cursor {position:?}");
+    }
 
     #[test]
     fn maps_xinput_buttons_and_ignores_wheel_details() {

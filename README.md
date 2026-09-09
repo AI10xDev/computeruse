@@ -163,7 +163,48 @@ are preserved. For example:
 These are physical keys on the active keyboard layout, not Unicode text input.
 The agent reports policy-request and local input/action durations separately on
 stderr; input/action time includes explicit `wait` actions. This distinguishes
-model latency from slow event emission without changing the JSONL trace format.
+model latency from slow event emission. When instructions explicitly request
+typing a known URL or query and pressing Enter, the policy is instructed to put
+`enter` last in the same key sequence, avoiding an unnecessary model round trip.
+
+### Proportional Cursor Control
+
+With `--execute`, the default `--mouse-control proportional` executes
+`mouse_move_to` through native X11 pixel warps and pointer queries, not a single
+unverified uinput jump. It converts normalized coordinates to the current X11
+root's pixel bounds, uses a proportional gain of 0.5 with short-horizon velocity
+damping, and limits each correction to 96 pixels. Steps shrink near the target.
+Observations are spaced by at least 16 ms; movement returns only after two
+consecutive readings are within 2 pixels. Failure stops the action batch before
+a following click or key sequence. The polling budget includes nominal travel
+time plus two seconds of settling allowance; it is not an X11 I/O timeout.
+
+`cursor_motion` in JSONL transitions contains one report per controlled target
+move, in action order: start/target/observed positions, residual pixels,
+correction count, elapsed milliseconds, final velocity, and peak measured speed.
+The local estimator uses actual pixel displacement and monotonic timestamps,
+resets velocity after gaps over 250 ms, and caps extrapolation at 100 ms. These
+reports also reach the next policy decision. They measure cursor movement, not
+visual target motion or whether the application accepted a click.
+
+This mode requires a native X11 session, working `DISPLAY`/Xauthority, and
+full-desktop frames matching that display's selected screen. Cropped frames or
+frames from another display do not share its coordinate mapping. The connected
+server's `XFree86-DGA` extension identifies Xorg even when `XDG_SESSION_TYPE` is
+missing or stale (for example, XFCE on Xorg with a `wayland` session label).
+Otherwise, `XDG_SESSION_TYPE=x11` is required. A server advertising `XWAYLAND` is
+always rejected: XWayland does not provide reliable global feedback for native
+Wayland windows. Absence of that extension alone is not treated as proof of X11.
+If detection is inconclusive, only set `XDG_SESSION_TYPE=x11` for the command
+after confirming that `DISPLAY` targets native Xorg, not merely an XFCE desktop.
+Use `--mouse-control direct` explicitly for the previous unverified uinput path,
+including on Wayland. Dry runs require neither X11 nor input devices.
+
+Raw `mouse_move(dx,dy)`, standalone `move`/`move-to`, and recorded-event replay
+keep their existing units and behavior. Device deltas are not screen pixels;
+the recorded `MouseTrajectory` remains a delta path, not measured cursor motion.
+Prefer `mouse_move_to` for precision. Cursor feedback cannot remove remote-model
+latency or replace fresh screenshots after navigation and focus changes.
 
 The package also installs a standalone Rust frame-splicing tool. Its output
 directory must not already contain files named `frame-*.png`:
@@ -192,11 +233,14 @@ computeruse agent \
 
 # Explicitly allow model-selected mouse and keyboard input.
 computeruse agent \
-  --frame ./recording.mp4 \
-  --frame-output ./extracted-frames \
+  --frames ./screencast-frames \
   --instructions ./gui-steps.txt \
   --execute
 ```
+
+Use prerecorded video for offline evaluation. `--frame --execute` is still
+accepted, with a warning: the recording cannot show the effects of actions sent
+to the current desktop, even when local cursor arrival can be measured.
 
 ### Concurrent Recording And Agent
 
@@ -286,7 +330,9 @@ for a separate RL trainer or replay buffer.
 Wayland intentionally does not expose a global pointer-position query. This
 project records movement as relative deltas. The standalone `listen`, `move`,
 and `move-to` operations still work without X11, but deterministic `record` and
-`play` initialization requires an X11 session. `move-to` creates an absolute
+`play` initialization and proportional agent cursor control require an X11
+session. The agent's explicit `--mouse-control direct` mode retains unverified
+Wayland injection. `move-to` creates an absolute
 virtual input device and uses normalized coordinates, where `(0, 0)` is the
 upper-left and `(65535, 65535)` is the lower-right of the compositor's mapped
 desktop.

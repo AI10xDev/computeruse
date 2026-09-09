@@ -1,10 +1,11 @@
 use anyhow::{Context, Result, bail};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use computeruse::{
-    Action, Button, Controller, Frame, FrameSequence, FrameSource, GptAstraPolicy, Key, KeyState,
-    KeyboardBackend, KeyboardController, KeyboardEvent, KeyboardListener, KeyboardPlaybackFilter,
-    LinuxKeyboard, LinuxMouse, Listener, MouseBackend, MouseEvent, MouseTrajectory, PlaybackFilter,
-    Point, Policy, Transition, X11ButtonListener, X11Cursor, extract_video_frames_sampled,
+    Action, Button, Controller, CursorBackend, CursorMotion, Frame, FrameSequence, FrameSource,
+    GptAstraPolicy, Key, KeyState, KeyboardBackend, KeyboardController, KeyboardEvent,
+    KeyboardListener, KeyboardPlaybackFilter, LinuxKeyboard, LinuxMouse, Listener, MouseBackend,
+    MouseEvent, MouseTrajectory, PlaybackFilter, Point, Policy, Transition, X11ButtonListener,
+    X11Cursor, extract_video_frames_sampled, move_cursor_to,
 };
 use serde::Serialize;
 use std::collections::VecDeque;
@@ -128,10 +129,19 @@ enum Command {
         /// Actually inject policy actions. Without this flag the agent is a dry run.
         #[arg(long)]
         execute: bool,
+        /// Proportional pixel control requires native X11; direct uses unverified uinput moves.
+        #[arg(long, value_enum, default_value = "proportional")]
+        mouse_control: MouseControl,
         /// Optional JSONL transition log for evaluation or offline learning.
         #[arg(long)]
         trace: Option<PathBuf>,
     },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum MouseControl {
+    Proportional,
+    Direct,
 }
 
 fn main() -> Result<()> {
@@ -156,6 +166,7 @@ fn main() -> Result<()> {
             max_steps,
             frame_timeout_ms,
             execute,
+            mouse_control,
             trace,
         } => run_agent(AgentOptions {
             frames,
@@ -167,6 +178,7 @@ fn main() -> Result<()> {
             max_steps,
             frame_timeout: Duration::from_millis(frame_timeout_ms),
             execute,
+            mouse_control,
             trace,
         }),
         command => control(command),
@@ -312,6 +324,7 @@ struct AgentOptions {
     max_steps: usize,
     frame_timeout: Duration,
     execute: bool,
+    mouse_control: MouseControl,
     trace: Option<PathBuf>,
 }
 
@@ -403,6 +416,28 @@ fn run_agent(options: AgentOptions) -> Result<()> {
     let policy = GptAstraPolicy::from_env(options.model)?;
     let mut transitions = Vec::new();
     let mut previous_progress = 0.0;
+    let mut cursor = if options.execute && options.mouse_control == MouseControl::Proportional {
+        let mut cursor = X11Cursor::connect_default().context(
+            "cannot initialize proportional cursor control; use native X11 or explicitly select --mouse-control direct for unverified movement",
+        )?;
+        cursor.require_native_x11()?;
+        let (width, height) = cursor.dimensions()?;
+        cursor.position()?;
+        eprintln!("agent mouse control: proportional, {width}x{height} X11 desktop pixels");
+        Some(cursor)
+    } else {
+        if options.execute {
+            eprintln!(
+                "agent mouse control: direct; cursor arrival and trajectory are not verified"
+            );
+        }
+        None
+    };
+    if options.execute && !frames.is_live() {
+        eprintln!(
+            "warning: prerecorded video cannot show the effects of injected actions; use --frames for live GUI feedback"
+        );
+    }
     let mut devices = if options.execute {
         Some((
             Controller::new(
@@ -438,15 +473,22 @@ fn run_agent(options: AgentOptions) -> Result<()> {
         let policy_started = Instant::now();
         let decision = policy.decide(&instructions, trajectory, &transitions)?;
         let policy_elapsed = policy_started.elapsed();
-        let input_elapsed = if let Some((mouse, keyboard)) = &mut devices {
+        let (input_elapsed, cursor_motion) = if let Some((mouse, keyboard)) = &mut devices {
             let input_started = Instant::now();
-            execute_actions(mouse, keyboard, &decision.actions)?;
+            let motion = execute_actions(
+                mouse,
+                keyboard,
+                cursor
+                    .as_mut()
+                    .map(|cursor| cursor as &mut dyn CursorBackend),
+                &decision.actions,
+            )?;
             let elapsed = input_started.elapsed();
             frames.discard_live_frames()?;
-            elapsed
+            (elapsed, motion)
         } else {
             validate_actions(&decision.actions)?;
-            Duration::ZERO
+            (Duration::ZERO, Vec::new())
         };
         eprintln!(
             "agent step {step}: policy={} ms, input={:.3} ms{}",
@@ -463,6 +505,7 @@ fn run_agent(options: AgentOptions) -> Result<()> {
             reward: progress - previous_progress,
             completed: decision.completed,
             executed: options.execute,
+            cursor_motion,
         };
         previous_progress = progress;
         println_json(&transition);
@@ -481,17 +524,25 @@ fn run_agent(options: AgentOptions) -> Result<()> {
 fn execute_actions<M: MouseBackend, K: KeyboardBackend>(
     mouse: &mut Controller<M>,
     keyboard: &mut KeyboardController<K>,
+    mut cursor: Option<&mut dyn CursorBackend>,
     actions: &[Action],
-) -> Result<()>
+) -> Result<Vec<CursorMotion>>
 where
     M::Error: std::error::Error + Send + Sync + 'static,
     K::Error: std::fmt::Display,
 {
     validate_actions(actions)?;
+    let mut cursor_motion = Vec::new();
     for action in actions {
         match action {
             Action::MouseMove { dx, dy } => mouse.move_relative(*dx, *dy)?,
-            Action::MouseMoveTo { x, y } => mouse.move_absolute(*x, *y)?,
+            Action::MouseMoveTo { x, y } => {
+                if let Some(cursor) = cursor.as_deref_mut() {
+                    cursor_motion.push(move_cursor_to(cursor, *x, *y)?);
+                } else {
+                    mouse.move_absolute(*x, *y)?;
+                }
+            }
             Action::MouseClick { button } => mouse.click(*button)?,
             Action::Scroll { delta, horizontal } if *horizontal => {
                 mouse.horizontal_wheel(*delta)?
@@ -509,7 +560,7 @@ where
             }
         }
     }
-    Ok(())
+    Ok(cursor_motion)
 }
 
 fn validate_actions(actions: &[Action]) -> Result<()> {
@@ -707,6 +758,199 @@ mod tests {
         }
     }
 
+    struct RecordingMouse<'a>(&'a mut Vec<String>);
+
+    impl MouseBackend for RecordingMouse<'_> {
+        type Error = Infallible;
+
+        fn button(&mut self, button: Button, state: ButtonState) -> Result<(), Self::Error> {
+            self.0.push(format!("{button}:{state:?}"));
+            Ok(())
+        }
+
+        fn move_relative(&mut self, dx: i32, dy: i32) -> Result<(), Self::Error> {
+            self.0.push(format!("relative:{dx},{dy}"));
+            Ok(())
+        }
+
+        fn move_absolute(&mut self, x: u16, y: u16) -> Result<(), Self::Error> {
+            self.0.push(format!("absolute:{x},{y}"));
+            Ok(())
+        }
+
+        fn wheel(&mut self, _: i32, _: bool) -> Result<(), Self::Error> {
+            unreachable!("these actions must not scroll")
+        }
+    }
+
+    struct ObservedCursor {
+        reads: usize,
+        fail_after: usize,
+    }
+
+    impl CursorBackend for ObservedCursor {
+        fn dimensions(&mut self) -> Result<(u16, u16)> {
+            Ok((1920, 1080))
+        }
+
+        fn position(&mut self) -> Result<Point> {
+            self.reads += 1;
+            if self.reads > self.fail_after {
+                bail!("cursor feedback lost");
+            }
+            Ok(Point { x: 960, y: 540 })
+        }
+
+        fn move_to(&mut self, _: Point) -> Result<()> {
+            unreachable!("cursor is already at the requested target")
+        }
+    }
+
+    #[test]
+    fn targeted_move_verifies_arrival_and_logs_feedback_before_clicking() {
+        let mut mouse_events = Vec::new();
+        let mut key_events = Vec::new();
+        let mut mouse = Controller::new(RecordingMouse(&mut mouse_events));
+        let mut keyboard = KeyboardController::new(RecordingKeyboard(&mut key_events));
+        let mut cursor = ObservedCursor {
+            reads: 0,
+            fail_after: 2,
+        };
+        let motion = execute_actions(
+            &mut mouse,
+            &mut keyboard,
+            Some(&mut cursor),
+            &[
+                Action::MouseMoveTo {
+                    x: 32_768,
+                    y: 32_768,
+                },
+                Action::MouseClick {
+                    button: Button::Left,
+                },
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(cursor.reads, 2);
+        assert_eq!(mouse_events, ["left:Down", "left:Up"]);
+        assert!(key_events.is_empty());
+        assert_eq!(motion.len(), 1);
+        assert_eq!(motion[0].estimate.position, Point { x: 960, y: 540 });
+        assert_eq!(motion[0].residual_pixels, 0.0);
+        let trace = serde_json::to_value(Transition {
+            step: 0,
+            frame: "frame.png".into(),
+            actions: vec![],
+            progress: 0.0,
+            reward: 0.0,
+            completed: false,
+            executed: true,
+            cursor_motion: motion,
+        })
+        .unwrap();
+        assert_eq!(trace["cursor_motion"][0]["target"]["x"], 960);
+        assert_eq!(
+            trace["cursor_motion"][0]["estimate"]["velocity"],
+            serde_json::json!([0.0, 0.0])
+        );
+    }
+
+    #[test]
+    fn lost_arrival_feedback_prevents_following_click_and_typing() {
+        let mut events = Vec::new();
+        let mut mouse = Controller::new(NoMouse);
+        let mut keyboard = KeyboardController::new(RecordingKeyboard(&mut events));
+        let mut cursor = ObservedCursor {
+            reads: 0,
+            fail_after: 1,
+        };
+        let error = execute_actions(
+            &mut mouse,
+            &mut keyboard,
+            Some(&mut cursor),
+            &[
+                Action::MouseMoveTo {
+                    x: 32_768,
+                    y: 32_768,
+                },
+                Action::MouseClick {
+                    button: Button::Left,
+                },
+                Action::KeyTap { key: "a".into() },
+            ],
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("cursor feedback lost"));
+        assert_eq!(cursor.reads, 2);
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn direct_absolute_and_raw_relative_movement_keep_their_units() {
+        let mut mouse_events = Vec::new();
+        let mut key_events = Vec::new();
+        let mut mouse = Controller::new(RecordingMouse(&mut mouse_events));
+        let mut keyboard = KeyboardController::new(RecordingKeyboard(&mut key_events));
+        let mut cursor = ObservedCursor {
+            reads: 0,
+            fail_after: 0,
+        };
+        assert!(
+            execute_actions(
+                &mut mouse,
+                &mut keyboard,
+                None,
+                &[Action::MouseMoveTo { x: 1234, y: 56_789 }],
+            )
+            .unwrap()
+            .is_empty()
+        );
+        assert!(
+            execute_actions(
+                &mut mouse,
+                &mut keyboard,
+                Some(&mut cursor),
+                &[Action::MouseMove { dx: -7, dy: 3 }],
+            )
+            .unwrap()
+            .is_empty()
+        );
+        assert_eq!(mouse_events, ["absolute:1234,56789", "relative:-7,3"]);
+        assert_eq!(cursor.reads, 0);
+    }
+
+    #[test]
+    fn invalid_batch_does_not_start_cursor_control() {
+        let mut events = Vec::new();
+        let mut mouse = Controller::new(NoMouse);
+        let mut keyboard = KeyboardController::new(RecordingKeyboard(&mut events));
+        let mut cursor = ObservedCursor {
+            reads: 0,
+            fail_after: 0,
+        };
+        assert!(
+            execute_actions(
+                &mut mouse,
+                &mut keyboard,
+                Some(&mut cursor),
+                &[
+                    Action::MouseMoveTo {
+                        x: 32_768,
+                        y: 32_768
+                    },
+                    Action::KeyTap {
+                        key: "unknown".into()
+                    },
+                ],
+            )
+            .is_err()
+        );
+        assert_eq!(cursor.reads, 0);
+        assert!(events.is_empty());
+    }
+
     #[test]
     fn key_sequence_emits_each_tap_once_and_preserves_double_letters() {
         let mut events = Vec::new();
@@ -717,8 +961,15 @@ mod tests {
             .map(|key| key.to_string())
             .collect();
         keys.push("shift+a".into());
+        keys.push("enter".into());
 
-        execute_actions(&mut mouse, &mut keyboard, &[Action::KeySequence { keys }]).unwrap();
+        execute_actions(
+            &mut mouse,
+            &mut keyboard,
+            None,
+            &[Action::KeySequence { keys }],
+        )
+        .unwrap();
 
         let mut expected: Vec<_> = [
             35, 18, 38, 38, 24, 52, 19, 18, 30, 38, 18, 31, 20, 30, 20, 18, 52, 46, 24, 50, 52, 30,
@@ -732,6 +983,8 @@ mod tests {
             (30, KeyState::Down),
             (30, KeyState::Up),
             (42, KeyState::Up),
+            (28, KeyState::Down),
+            (28, KeyState::Up),
         ]);
         assert_eq!(events, expected);
     }
@@ -748,7 +1001,7 @@ mod tests {
             },
         ];
 
-        assert!(execute_actions(&mut mouse, &mut keyboard, &actions).is_err());
+        assert!(execute_actions(&mut mouse, &mut keyboard, None, &actions).is_err());
         assert!(events.is_empty());
     }
 
@@ -831,8 +1084,45 @@ mod tests {
         .unwrap();
         assert!(matches!(
             cli.command,
-            Command::Agent { frames: Some(frames), .. } if frames == *"frames"
+            Command::Agent { frames: Some(frames), mouse_control: MouseControl::Proportional, .. } if frames == *"frames"
         ));
+    }
+
+    #[test]
+    fn direct_mouse_control_requires_an_explicit_selection() {
+        let cli = Cli::try_parse_from([
+            "computeruse",
+            "agent",
+            "--frames",
+            "frames",
+            "--instructions",
+            "steps.txt",
+            "--execute",
+            "--mouse-control",
+            "direct",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Agent {
+                mouse_control: MouseControl::Direct,
+                execute: true,
+                ..
+            }
+        ));
+        assert!(
+            Cli::try_parse_from([
+                "computeruse",
+                "agent",
+                "--frames",
+                "frames",
+                "--instructions",
+                "steps.txt",
+                "--mouse-control",
+                "unknown",
+            ])
+            .is_err()
+        );
     }
 
     #[test]
