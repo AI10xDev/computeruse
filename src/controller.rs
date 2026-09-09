@@ -1,6 +1,6 @@
 use crate::{Button, ButtonState, MouseEvent};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const CLICK_HOLD_DURATION: Duration = Duration::from_millis(20);
 
@@ -101,6 +101,7 @@ impl<B: MouseBackend> Controller<B> {
         filter: PlaybackFilter,
     ) -> Result<(), B::Error> {
         let mut previous_time: Option<f64> = None;
+        let mut button_down_at = [None; 5];
         for event in events {
             if speed > 0.0
                 && let Some(previous) = previous_time
@@ -111,9 +112,20 @@ impl<B: MouseBackend> Controller<B> {
             previous_time = Some(event.timestamp());
 
             match *event {
-                MouseEvent::Button { button, state, .. } if filter.buttons => {
-                    self.backend.button(button, state)?
-                }
+                MouseEvent::Button { button, state, .. } if filter.buttons => match state {
+                    ButtonState::Down => {
+                        self.backend.button(button, state)?;
+                        button_down_at[button_index(button)] = Some(Instant::now());
+                    }
+                    ButtonState::Up => {
+                        let index = button_index(button);
+                        if let Some(pressed_at) = button_down_at[index] {
+                            thread::sleep(CLICK_HOLD_DURATION.saturating_sub(pressed_at.elapsed()));
+                        }
+                        self.backend.button(button, state)?;
+                        button_down_at[index] = None;
+                    }
+                },
                 MouseEvent::Move { dx, dy, .. } if filter.movement => {
                     self.backend.move_relative(dx, dy)?
                 }
@@ -124,6 +136,16 @@ impl<B: MouseBackend> Controller<B> {
             }
         }
         Ok(())
+    }
+}
+
+fn button_index(button: Button) -> usize {
+    match button {
+        Button::Left => 0,
+        Button::Right => 1,
+        Button::Middle => 2,
+        Button::Side => 3,
+        Button::Extra => 4,
     }
 }
 
@@ -246,5 +268,30 @@ mod tests {
             )
             .unwrap();
         assert_eq!(controller.backend.0, ["move:2,3", "wheel:1,false"]);
+    }
+
+    #[test]
+    fn playback_preserves_a_minimum_button_hold() {
+        let events = [
+            MouseEvent::Button {
+                button: Button::Left,
+                state: ButtonState::Down,
+                time: 1.0,
+            },
+            MouseEvent::Button {
+                button: Button::Left,
+                state: ButtonState::Up,
+                time: 1.0,
+            },
+        ];
+        let mut controller = Controller::new(FakeBackend::default());
+        let started = Instant::now();
+
+        controller
+            .play(&events, 0.0, PlaybackFilter::default())
+            .unwrap();
+
+        assert!(started.elapsed() >= CLICK_HOLD_DURATION);
+        assert_eq!(controller.backend.0, ["left:Down", "left:Up"]);
     }
 }

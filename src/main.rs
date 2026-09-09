@@ -1,12 +1,13 @@
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use computeruse::{
-    Action, Button, Controller, FrameSequence, GptAstraPolicy, Key, KeyState, KeyboardController,
-    KeyboardEvent, KeyboardListener, KeyboardPlaybackFilter, LinuxKeyboard, LinuxMouse, Listener,
-    MouseEvent, MouseTrajectory, PlaybackFilter, Point, Policy, Transition, X11ButtonListener,
-    X11Cursor, extract_video_frames,
+    Action, Button, Controller, Frame, FrameSequence, FrameSource, GptAstraPolicy, Key, KeyState,
+    KeyboardController, KeyboardEvent, KeyboardListener, KeyboardPlaybackFilter, LinuxKeyboard,
+    LinuxMouse, Listener, MouseEvent, MouseTrajectory, PlaybackFilter, Point, Policy, Transition,
+    X11ButtonListener, X11Cursor, extract_video_frames,
 };
 use serde::Serialize;
+use std::collections::VecDeque;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, BufWriter, Write};
 use std::path::PathBuf;
@@ -101,22 +102,28 @@ enum Command {
         #[arg(long)]
         no_release: bool,
     },
-    /// Run the instruction-driven visual policy over each frame of a video.
+    /// Run the instruction-driven visual policy over live frames or a video.
     Agent {
+        /// Directory to watch for live PNG, JPEG, or WebP frames.
+        #[arg(long, conflicts_with = "frame", required_unless_present = "frame")]
+        frames: Option<PathBuf>,
         /// Video file to process, such as an MP4 file.
-        #[arg(long)]
-        frame: PathBuf,
+        #[arg(long, conflicts_with = "frames", required_unless_present = "frames")]
+        frame: Option<PathBuf>,
         /// Keep extracted PNG frames in this directory instead of a temporary directory.
-        #[arg(long)]
+        #[arg(long, requires = "frame")]
         frame_output: Option<PathBuf>,
         #[arg(long)]
         instructions: PathBuf,
-        #[arg(long, default_value = "gpt-Astra")]
+        #[arg(long, default_value = "gpt-6-astra")]
         model: String,
         #[arg(long, default_value_t = 3)]
         trajectory: usize,
         #[arg(long, default_value_t = 50)]
         max_steps: usize,
+        /// Maximum time to wait for the next live frame.
+        #[arg(long, default_value_t = 10_000)]
+        frame_timeout_ms: u64,
         /// Actually inject policy actions. Without this flag the agent is a dry run.
         #[arg(long)]
         execute: bool,
@@ -139,21 +146,25 @@ fn main() -> Result<()> {
         }
         Command::KeyboardRecord { output, stop_key } => keyboard_record(output, stop_key),
         Command::Agent {
+            frames,
             frame,
             frame_output,
             instructions,
             model,
             trajectory,
             max_steps,
+            frame_timeout_ms,
             execute,
             trace,
         } => run_agent(AgentOptions {
+            frames,
             frame,
             frame_output,
             instructions,
             model,
             trajectory,
             max_steps,
+            frame_timeout: Duration::from_millis(frame_timeout_ms),
             execute,
             trace,
         }),
@@ -291,14 +302,41 @@ fn keyboard_record(output: PathBuf, stop_key: Key) -> Result<()> {
 }
 
 struct AgentOptions {
-    frame: PathBuf,
+    frames: Option<PathBuf>,
+    frame: Option<PathBuf>,
     frame_output: Option<PathBuf>,
     instructions: PathBuf,
     model: String,
     trajectory: usize,
     max_steps: usize,
+    frame_timeout: Duration,
     execute: bool,
     trace: Option<PathBuf>,
+}
+
+enum AgentFrameSource {
+    Live(FrameSource),
+    Video(FrameSequence),
+}
+
+impl AgentFrameSource {
+    fn is_live(&self) -> bool {
+        matches!(self, Self::Live(_))
+    }
+
+    fn next(&mut self, timeout: Duration) -> Result<Option<&VecDeque<Frame>>> {
+        match self {
+            Self::Live(source) => source.next(timeout),
+            Self::Video(source) => source.advance(),
+        }
+    }
+
+    fn discard_live_frames(&mut self) -> Result<()> {
+        if let Self::Live(source) = self {
+            source.discard_existing()?;
+        }
+        Ok(())
+    }
 }
 
 struct TemporaryFrameDirectory {
@@ -334,22 +372,28 @@ fn run_agent(options: AgentOptions) -> Result<()> {
             options.instructions.display()
         )
     })?;
-    let temporary_frames = options
-        .frame_output
-        .is_none()
+    let temporary_frames = (options.frame.is_some() && options.frame_output.is_none())
         .then(TemporaryFrameDirectory::new)
         .transpose()?;
-    let frame_output = options
-        .frame_output
-        .as_deref()
-        .or_else(|| {
-            temporary_frames
-                .as_ref()
-                .map(|directory| directory.path.as_path())
-        })
-        .expect("a persistent or temporary frame output exists");
-    let paths = extract_video_frames(&options.frame, frame_output)?;
-    let mut frames = FrameSequence::new(paths, options.trajectory)?;
+    let mut frames = if let Some(directory) = options.frames {
+        AgentFrameSource::Live(FrameSource::new(directory, options.trajectory)?)
+    } else {
+        let video = options
+            .frame
+            .as_ref()
+            .expect("clap requires a frame source");
+        let frame_output = options
+            .frame_output
+            .as_deref()
+            .or_else(|| {
+                temporary_frames
+                    .as_ref()
+                    .map(|directory| directory.path.as_path())
+            })
+            .expect("a video frame output exists");
+        let paths = extract_video_frames(video, frame_output)?;
+        AgentFrameSource::Video(FrameSequence::new(paths, options.trajectory)?)
+    };
     let policy = GptAstraPolicy::from_env(options.model)?;
     let mut transitions = Vec::new();
     let mut previous_progress = 0.0;
@@ -369,9 +413,17 @@ fn run_agent(options: AgentOptions) -> Result<()> {
     };
 
     for step in 0..options.max_steps {
-        let trajectory = frames.advance()?.with_context(|| {
+        let missing_frame_context = if frames.is_live() {
+            format!(
+                "timed out after {} ms waiting for a new live frame at step {step}",
+                options.frame_timeout.as_millis()
+            )
+        } else {
             format!("video ended before the agent completed the instructions at step {step}")
-        })?;
+        };
+        let trajectory = frames
+            .next(options.frame_timeout)?
+            .with_context(|| missing_frame_context)?;
         let frame = trajectory
             .back()
             .expect("trajectory has a new frame")
@@ -384,6 +436,7 @@ fn run_agent(options: AgentOptions) -> Result<()> {
         validate_actions(&decision.actions)?;
         if let Some((mouse, keyboard)) = &mut devices {
             execute_actions(mouse, keyboard, &decision.actions)?;
+            frames.discard_live_frames()?;
         }
         let progress = decision.progress.clamp(0.0, 1.0);
         let transition = Transition {
@@ -634,8 +687,42 @@ mod tests {
         .unwrap();
         assert!(matches!(
             cli.command,
-            Command::Agent { frame, .. } if frame == *"recording.mp4"
+            Command::Agent { frame: Some(frame), .. } if frame == *"recording.mp4"
         ));
+    }
+
+    #[test]
+    fn agent_accepts_a_live_directory_with_the_frames_flag() {
+        let cli = Cli::try_parse_from([
+            "computeruse",
+            "agent",
+            "--frames",
+            "frames",
+            "--instructions",
+            "steps.txt",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Agent { frames: Some(frames), .. } if frames == *"frames"
+        ));
+    }
+
+    #[test]
+    fn agent_rejects_multiple_frame_sources() {
+        assert!(
+            Cli::try_parse_from([
+                "computeruse",
+                "agent",
+                "--frame",
+                "recording.mp4",
+                "--frames",
+                "frames",
+                "--instructions",
+                "steps.txt",
+            ])
+            .is_err()
+        );
     }
 
     #[test]

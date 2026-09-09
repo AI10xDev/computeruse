@@ -219,7 +219,7 @@ fn parse_key_code(name: &str) -> Option<u16> {
         "left_shift" | "shift" => 42,
         "backslash" => 43,
         "comma" => 51,
-        "dot" | "period" => 52,
+        "." | "dot" | "period" => 52,
         "slash" => 53,
         "right_shift" => 54,
         "left_alt" | "alt" => 56,
@@ -347,6 +347,11 @@ mod tests {
                 (29, KeyState::Up),
             ]
         );
+    }
+
+    #[test]
+    fn literal_period_parses_as_dot_key() {
+        assert_eq!(".".parse::<Key>().unwrap().scan_code, 52);
     }
 
     #[test]

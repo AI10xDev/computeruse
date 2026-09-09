@@ -49,8 +49,12 @@ impl LinuxMouse {
             .with_relative_axes(&axes)?
             .build()?;
 
+        let mut properties = AttributeSet::<PropType>::new();
+        properties.insert(PropType::POINTER);
         let absolute = VirtualDevice::builder()?
             .name("computeruse absolute pointer")
+            .with_properties(&properties)?
+            .with_keys(&keys)?
             .with_absolute_axis(&evdev::UinputAbsSetup::new(
                 AbsoluteAxisCode::ABS_X,
                 AbsInfo::new(0, 0, ABS_MAX, 0, 0, 1),

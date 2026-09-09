@@ -141,12 +141,14 @@ release them in reverse order, matching `boppreh/keyboard` behavior.
 
 ## Visual Agent
 
-The `agent` command accepts a video through `--frame`, extracts every image with
-FFmpeg, and evaluates GUI instructions from a text file frame by frame. Each
-policy call receives the latest bounded trajectory and prior transitions, then
-emits typed mouse, keyboard, scroll, or wait actions. The transition log
-includes the policy's progress estimate and its change as a reward signal for
-evaluation or offline reinforcement learning.
+The `agent` command evaluates GUI instructions from a text file against either
+a live frame directory supplied through `--frames` or a recorded video supplied
+through `--frame`. In live mode it waits for new PNG, JPEG, or WebP images after
+each decision, providing the state-estimation feedback loop needed to observe
+the result of executed actions. Each policy call receives the latest bounded
+trajectory and prior transitions, then emits typed mouse, keyboard, scroll, or
+wait actions. The transition log includes the policy's progress estimate and
+its change as a reward signal for evaluation or offline reinforcement learning.
 
 The package also installs a standalone Rust frame-splicing tool. Its output
 directory must not already contain files named `frame-*.png`:
@@ -155,13 +157,19 @@ directory must not already contain files named `frame-*.png`:
 video-frames --frame ./recording.mp4 --output ./video-frames
 ```
 
-Set an API key and optionally an OpenAI-compatible endpoint:
+Set the Azure API key and either a Foundry project endpoint or Azure OpenAI
+endpoint:
 
 ```bash
-export OPENAI_API_KEY=...
-export OPENAI_BASE_URL=https://api.openai.com/v1
+export AZURE_OPENAI_API_KEY=...
+export AZURE_OPENAI_ENDPOINT=https://RESOURCE.services.ai.azure.com/api/projects/PROJECT
 
-# Safe default: inspect decisions as JSONL without injecting input.
+# Watch frames produced by a running screencast process.
+computeruse agent \
+  --frames ./screencast-frames \
+  --instructions ./gui-steps.txt
+
+# Process a completed recording without injecting input.
 computeruse agent \
   --frame ./recording.mp4 \
   --instructions ./gui-steps.txt \
@@ -175,11 +183,43 @@ computeruse agent \
   --execute
 ```
 
-The default model is `gpt-Astra`; override it with `--model` for the name
+### Concurrent Recording And Agent
+
+`record.sh` runs one FFmpeg process that records the X11 display at 30 FPS while
+also sampling temporary observations at 2 FPS. The agent watches those images
+through `--frames`, but requests are serialized: Astra receives one bounded
+frame trajectory per policy decision, not a continuous 2 FPS stream. After an
+executed action, frames captured before that action completed are discarded so
+the next decision observes post-action state. When the agent completes or
+fails, the script stops FFmpeg cleanly, finalizes the MP4, and removes the
+temporary images. The output path must not already exist.
+
+```bash
+printf '%s\n' 'Open the browser settings page.' > gui-steps.txt
+
+# Safe default: record and print decisions without controlling the GUI.
+./record.sh ./recording.mp4 ./gui-steps.txt
+
+# Allow the feedback loop to execute model-selected actions and save a trace.
+./record.sh ./recording.mp4 ./gui-steps.txt \
+  --execute \
+  --trace ./trajectory.jsonl
+```
+
+Additional arguments after the instructions path are forwarded to
+`computeruse agent`. Set `DISPLAY` to select a different X11 display and
+`COMPUTERUSE_BIN` to override the executable used by the script. If Azure
+environment variables are unset, the script reads the API key from line 1 and
+the endpoint from line 3 of the ignored local `ast` file. Set
+`COMPUTERUSE_CREDENTIALS` to use a different credentials file.
+
+The default model is `gpt-6-astra`; override it with `--model` for the name
 exposed by your endpoint. Unless `--frame-output` is supplied, extracted frames
 are kept in a temporary directory and removed when the command exits. The
-agent processes one video frame per step. `--execute` is deliberately required
-for input injection.
+agent processes one video frame per step in offline mode. In live mode,
+`--frame-timeout-ms` controls how long it waits for a new observation and
+defaults to 10 seconds. `--execute` is deliberately required for input
+injection.
 Policy actions are atomic key taps/hotkeys and mouse clicks rather than
 persistent holds. Each decision is limited to 16 actions, relative movement to
 32767 units per axis, scrolling to 100 units, and waits to 30 seconds.

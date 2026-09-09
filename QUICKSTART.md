@@ -1,7 +1,7 @@
 # Quickstart
 
 `computeruse` captures and controls the mouse and keyboard on Linux. Its visual
-agent sends video frames and GUI instructions to gpt-Astra, then prints the
+agent sends video frames and GUI instructions to GPT Astra, then prints the
 model's proposed actions. Input is only injected when you add `--execute`.
 
 ## 1. Build
@@ -28,16 +28,19 @@ group setup in the [README](README.md#requirements).
 ./target/release/computeruse hotkey 'ctrl+l'
 ```
 
-## 4. Run The gpt-Astra Agent
+## 4. Run The GPT Astra Agent
 
 Record an MP4 (or another format supported by FFmpeg) and write one or more GUI
 instructions:
 
 ```bash
 printf '%s\n' 'Open the browser settings page.' > gui-steps.txt
-export OPENAI_API_KEY=...
-export OPENAI_BASE_URL=https://api.openai.com/v1
+export AZURE_OPENAI_API_KEY=...
+export AZURE_OPENAI_ENDPOINT=https://RESOURCE.services.ai.azure.com/api/projects/PROJECT
 ```
+
+When using `record.sh`, those values can instead be stored in the ignored local
+`ast` file with the API key on line 1 and endpoint on line 3.
 
 Start with dry-run mode. It prints JSON decisions but does not control input:
 
@@ -48,7 +51,7 @@ Start with dry-run mode. It prints JSON decisions but does not control input:
   --trace ./trajectory.jsonl
 ```
 
-The default model is `gpt-Astra`. If your compatible endpoint exposes it under
+The default model is `gpt-6-astra`. If your compatible endpoint exposes it under
 a different name, pass `--model NAME`.
 
 After reviewing the dry-run output, add `--execute` to allow the model-selected

@@ -3,7 +3,7 @@ use base64::Engine;
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -32,6 +32,7 @@ impl Frame {
 pub struct FrameSource {
     directory: PathBuf,
     seen: HashMap<PathBuf, FrameIdentity>,
+    discarded_paths: HashSet<PathBuf>,
     trajectory: VecDeque<Frame>,
     trajectory_len: usize,
 }
@@ -61,9 +62,21 @@ impl FrameSource {
         Ok(Self {
             directory,
             seen: HashMap::new(),
+            discarded_paths: HashSet::new(),
             trajectory: VecDeque::new(),
             trajectory_len,
         })
+    }
+
+    /// Ignore frames that already exist, so the next observation is produced after this call.
+    pub fn discard_existing(&mut self) -> Result<()> {
+        for entry in fs::read_dir(&self.directory)? {
+            let path = entry?.path();
+            if media_type(&path).is_some() {
+                self.discarded_paths.insert(path);
+            }
+        }
+        Ok(())
     }
 
     pub fn next(&mut self, timeout: Duration) -> Result<Option<&VecDeque<Frame>>> {
@@ -109,8 +122,10 @@ impl FrameSource {
                     len: metadata.len(),
                     modified: metadata.modified().ok(),
                 };
-                (media_type(&path).is_some() && self.seen.get(&path) != Some(&identity))
-                    .then_some((path, identity))
+                (media_type(&path).is_some()
+                    && !self.discarded_paths.contains(&path)
+                    && self.seen.get(&path) != Some(&identity))
+                .then_some((path, identity))
             })
             .collect::<Vec<_>>();
         paths.sort_by_cached_key(|(path, identity)| (identity.modified, path.clone()));
@@ -267,27 +282,80 @@ pub trait Policy {
     ) -> Result<AgentDecision>;
 }
 
+enum ApiKind {
+    ChatCompletions,
+    Responses,
+}
+
 pub struct GptAstraPolicy {
     client: Client,
     endpoint: String,
     api_key: String,
     model: String,
+    api_kind: ApiKind,
 }
 
 impl GptAstraPolicy {
     pub fn from_env(model: impl Into<String>) -> Result<Self> {
-        let api_key = std::env::var("OPENAI_API_KEY")
-            .context("OPENAI_API_KEY is required for the agent command")?;
-        let base_url =
-            std::env::var("OPENAI_BASE_URL").unwrap_or_else(|_| "https://api.openai.com/v1".into());
+        let azure_endpoint = std::env::var("AZURE_OPENAI_ENDPOINT").ok();
+        let (api_key, endpoint, api_kind) = if let Some(endpoint) = azure_endpoint {
+            let api_key = std::env::var("AZURE_OPENAI_API_KEY")
+                .context("AZURE_OPENAI_API_KEY is required when AZURE_OPENAI_ENDPOINT is set")?;
+            let endpoint = azure_responses_endpoint(&endpoint);
+            (api_key, endpoint, ApiKind::Responses)
+        } else {
+            let api_key = std::env::var("OPENAI_API_KEY").context(
+                "OPENAI_API_KEY or AZURE_OPENAI_API_KEY is required for the agent command",
+            )?;
+            let base_url = std::env::var("OPENAI_BASE_URL")
+                .unwrap_or_else(|_| "https://api.openai.com/v1".into());
+            (
+                api_key,
+                format!("{}/chat/completions", base_url.trim_end_matches('/')),
+                ApiKind::ChatCompletions,
+            )
+        };
         Ok(Self {
             client: Client::builder()
                 .timeout(Duration::from_secs(120))
                 .build()?,
-            endpoint: format!("{}/chat/completions", base_url.trim_end_matches('/')),
+            endpoint,
             api_key,
             model: model.into(),
+            api_kind,
         })
+    }
+}
+
+fn azure_responses_endpoint(endpoint: &str) -> String {
+    let (endpoint, query) = endpoint
+        .split_once('?')
+        .map_or((endpoint, None), |(endpoint, query)| {
+            (endpoint, Some(query))
+        });
+    let endpoint = endpoint.trim_end_matches('/');
+    let is_project_endpoint = endpoint.contains("/api/projects/");
+    let endpoint = if endpoint.ends_with("/responses") {
+        endpoint.to_owned()
+    } else if is_project_endpoint {
+        format!("{endpoint}/openai/v1/responses")
+    } else {
+        format!("{endpoint}/responses")
+    };
+    let is_v1_endpoint = endpoint.contains("/v1/");
+    let query = query
+        .unwrap_or_default()
+        .split('&')
+        .filter(|parameter| {
+            let key = parameter.split_once('=').map_or(*parameter, |(key, _)| key);
+            !parameter.is_empty() && !(is_v1_endpoint && key == "api-version")
+        })
+        .collect::<Vec<_>>()
+        .join("&");
+    if query.is_empty() {
+        endpoint
+    } else {
+        format!("{endpoint}?{query}")
     }
 }
 
@@ -298,13 +366,11 @@ impl Policy for GptAstraPolicy {
         trajectory: &VecDeque<Frame>,
         transitions: &[Transition],
     ) -> Result<AgentDecision> {
-        let mut content = vec![json!({
-            "type": "text",
-            "text": format!(
-                "GUI instructions:\n{instructions}\n\nPrevious transitions:\n{}",
-                serde_json::to_string(transitions)?
-            )
-        })];
+        let prompt = format!(
+            "Return the policy decision as JSON.\n\nGUI instructions:\n{instructions}\n\nPrevious transitions:\n{}",
+            serde_json::to_string(transitions)?
+        );
+        let mut content = vec![json!({ "type": "text", "text": prompt })];
         for (index, frame) in trajectory.iter().enumerate() {
             content.push(json!({
                 "type": "text",
@@ -315,34 +381,67 @@ impl Policy for GptAstraPolicy {
                 "image_url": { "url": frame.data_url(), "detail": "high" }
             }));
         }
-        let body = json!({
-            "model": self.model,
-            "messages": [
-                {
-                    "role": "system",
-                    "content": "Act as a cautious GUI policy. Infer state changes from the ordered frames and return JSON only. Use normalized 0..65535 coordinates for mouse_move_to. Prefer one small, reversible action per observation. Never invent an action type. Set completed only when the latest frame visibly proves the instructions are complete. Output: {\"rationale\":string,\"actions\":[action],\"completed\":bool,\"progress\":number}. Action types: mouse_move(dx,dy), mouse_move_to(x,y), mouse_click(button), scroll(delta,horizontal), key_tap(key), hotkey(keys), wait(milliseconds). Buttons: left, right, middle, side, extra. Named keys and hotkeys use forms such as enter, tab, escape, ctrl+shift+a. Relative movement is limited to +/-32767, scrolling to +/-100, and waits to 30000 milliseconds."
-                },
-                { "role": "user", "content": content }
-            ],
-            "response_format": { "type": "json_object" },
-            "temperature": 0.1
-        });
-        let response = self
-            .client
-            .post(&self.endpoint)
-            .bearer_auth(&self.api_key)
-            .json(&body)
-            .send()
-            .context("gpt-Astra policy request failed")?;
+        let system = "Act as a cautious GUI policy. Infer state changes from the ordered frames and return JSON only. Use normalized 0..65535 coordinates for mouse_move_to. Prefer one small, reversible action per observation. Never invent an action type. Set completed only when the latest frame visibly proves the instructions are complete. Output: {\"rationale\":string,\"actions\":[action],\"completed\":bool,\"progress\":number}. Every action must be a flat object with a required \"type\" field, for example {\"type\":\"mouse_move_to\",\"x\":1800,\"y\":800}; do not use {\"mouse_move_to\":{...}}. Valid type/field sets: mouse_move(dx,dy), mouse_move_to(x,y), mouse_click(button), scroll(delta,horizontal), key_tap(key), hotkey(keys), wait(milliseconds). Buttons: left, right, middle, side, extra. Named keys and hotkeys use forms such as enter, tab, escape, ctrl+shift+a. Relative movement is limited to +/-32767, scrolling to +/-100, and waits to 30000 milliseconds.";
+        let (body, azure) = match self.api_kind {
+            ApiKind::ChatCompletions => (
+                json!({
+                    "model": self.model,
+                    "messages": [
+                        { "role": "system", "content": system },
+                        { "role": "user", "content": content }
+                    ],
+                    "response_format": { "type": "json_object" },
+                    "temperature": 0.1
+                }),
+                false,
+            ),
+            ApiKind::Responses => {
+                for item in &mut content {
+                    if item["type"] == "text" {
+                        item["type"] = json!("input_text");
+                    } else if item["type"] == "image_url" {
+                        let image_url = item["image_url"]["url"].take();
+                        *item = json!({ "type": "input_image", "image_url": image_url, "detail": "high" });
+                    }
+                }
+                (
+                    json!({
+                        "model": self.model,
+                        "instructions": system,
+                        "input": [{ "role": "user", "content": content }],
+                        "text": { "format": { "type": "json_object" } }
+                    }),
+                    true,
+                )
+            }
+        };
+        let request = self.client.post(&self.endpoint).json(&body);
+        let response = if azure {
+            request.header("api-key", &self.api_key)
+        } else {
+            request.bearer_auth(&self.api_key)
+        }
+        .send()
+        .context("GPT Astra policy request failed")?;
         let status = response.status();
         let value: Value = response.json().context("policy response was not JSON")?;
         if !status.is_success() {
             bail!("policy request returned {status}: {value}");
         }
-        let content = value
-            .pointer("/choices/0/message/content")
-            .and_then(Value::as_str)
-            .context("policy response did not contain choices[0].message.content")?;
+        let content = match self.api_kind {
+            ApiKind::ChatCompletions => value
+                .pointer("/choices/0/message/content")
+                .and_then(Value::as_str),
+            ApiKind::Responses => value
+                .get("output")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|item| item.get("content")?.as_array())
+                .flatten()
+                .find_map(|item| item.get("text")?.as_str()),
+        }
+        .context("policy response did not contain model output text")?;
         let decision: AgentDecision = parse_decision(content)
             .with_context(|| format!("policy returned an invalid decision: {content}"))?;
         if !(0.0..=1.0).contains(&decision.progress) {
@@ -367,7 +466,46 @@ fn parse_decision(content: &str) -> Result<AgentDecision, serde_json::Error> {
     } else {
         trimmed
     };
-    serde_json::from_str(json)
+    let mut value: Value = serde_json::from_str(json)?;
+    normalize_externally_tagged_actions(&mut value);
+    serde_json::from_value(value)
+}
+
+fn normalize_externally_tagged_actions(value: &mut Value) {
+    const ACTION_TYPES: [&str; 7] = [
+        "mouse_move",
+        "mouse_move_to",
+        "mouse_click",
+        "scroll",
+        "key_tap",
+        "hotkey",
+        "wait",
+    ];
+
+    let Some(actions) = value.get_mut("actions").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for action in actions {
+        let Value::Object(object) = action else {
+            continue;
+        };
+        if object.contains_key("type") || object.len() != 1 {
+            continue;
+        }
+        let Some(action_type) = object.keys().next().cloned() else {
+            continue;
+        };
+        if !ACTION_TYPES.contains(&action_type.as_str()) {
+            continue;
+        }
+        let Some(fields) = object.get(&action_type).and_then(Value::as_object).cloned() else {
+            continue;
+        };
+        let mut normalized = serde_json::Map::new();
+        normalized.insert("type".into(), Value::String(action_type));
+        normalized.extend(fields);
+        *action = Value::Object(normalized);
+    }
 }
 
 #[cfg(test)]
@@ -405,6 +543,48 @@ mod tests {
     }
 
     #[test]
+    fn accepts_externally_tagged_policy_actions() {
+        let decision = parse_decision(
+            r#"{"rationale":"move","actions":[{"mouse_move_to":{"x":1800,"y":800}}],"completed":false,"progress":0.5}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            decision.actions[0],
+            Action::MouseMoveTo { x: 1800, y: 800 }
+        ));
+    }
+
+    #[test]
+    fn routes_foundry_project_endpoints_to_openai_responses() {
+        assert_eq!(
+            azure_responses_endpoint(
+                "https://example.services.ai.azure.com/api/projects/example-project"
+            ),
+            "https://example.services.ai.azure.com/api/projects/example-project/openai/v1/responses"
+        );
+        assert_eq!(
+            azure_responses_endpoint("https://example.openai.azure.com/openai/v1/"),
+            "https://example.openai.azure.com/openai/v1/responses"
+        );
+    }
+
+    #[test]
+    fn preserves_foundry_endpoint_query_parameters() {
+        assert_eq!(
+            azure_responses_endpoint(
+                "https://example.services.ai.azure.com/api/projects/example-project?region=eastus"
+            ),
+            "https://example.services.ai.azure.com/api/projects/example-project/openai/v1/responses?region=eastus"
+        );
+        assert_eq!(
+            azure_responses_endpoint(
+                "https://example.services.ai.azure.com/api/projects/example-project/openai/v1/responses?api-version=preview"
+            ),
+            "https://example.services.ai.azure.com/api/projects/example-project/openai/v1/responses"
+        );
+    }
+
+    #[test]
     fn frame_source_starts_with_latest_bounded_trajectory() {
         let suffix = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -429,6 +609,30 @@ mod tests {
         fs::write(directory.join("003.png"), &changed).unwrap();
         let trajectory = source.next(Duration::ZERO).unwrap().unwrap();
         assert_eq!(trajectory.back().unwrap().bytes, changed);
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn frame_source_discards_frames_created_before_an_action_finishes() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!("computeruse-barrier-{suffix}"));
+        fs::create_dir(&directory).unwrap();
+        let stale = directory.join("001.png");
+        fs::write(&stale, fake_png(b's')).unwrap();
+
+        let mut source = FrameSource::new(&directory, 1).unwrap();
+        source.discard_existing().unwrap();
+        fs::write(&stale, fake_png(b'x')).unwrap();
+        assert!(source.next(Duration::ZERO).unwrap().is_none());
+
+        let fresh = directory.join("002.png");
+        fs::write(&fresh, fake_png(b'f')).unwrap();
+        let trajectory = source.next(Duration::ZERO).unwrap().unwrap();
+        assert_eq!(trajectory.back().unwrap().path, fresh);
 
         fs::remove_dir_all(directory).unwrap();
     }
