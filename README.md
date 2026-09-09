@@ -150,6 +150,21 @@ trajectory and prior transitions, then emits typed mouse, keyboard, scroll, or
 wait actions. The transition log includes the policy's progress estimate and
 its change as a reward signal for evaluation or offline reinforcement learning.
 
+For typing into a focused field, the policy can emit a `key_sequence` action
+with 1 to 256 named keys or hotkeys. The entire sequence is validated before any
+actions execute, then each entry is pressed and released once locally without
+a model request or screenshot wait between letters. Intentional doubled letters
+are preserved. For example:
+
+```json
+{"type":"key_sequence","keys":["h","e","l","l","o","dot","shift+a"]}
+```
+
+These are physical keys on the active keyboard layout, not Unicode text input.
+The agent reports policy-request and local input/action durations separately on
+stderr; input/action time includes explicit `wait` actions. This distinguishes
+model latency from slow event emission without changing the JSONL trace format.
+
 The package also installs a standalone Rust frame-splicing tool. Its output
 directory must not already contain files named `frame-*.png`:
 
@@ -189,8 +204,11 @@ computeruse agent \
 also sampling temporary observations at 2 FPS. The agent watches those images
 through `--frames`, but requests are serialized: Astra receives one bounded
 frame trajectory per policy decision, not a continuous 2 FPS stream. After an
-executed action, frames captured before that action completed are discarded so
-the next decision observes post-action state. When the agent completes or
+executed action, already-published frames and the in-memory screenshot history
+are discarded. The next decision waits for newly published images instead of
+reusing pre-action visual context. Publication does not guarantee the GUI has
+finished rendering, so the policy is instructed to wait for delayed feedback
+rather than blindly retype executed keys. When the agent completes or
 fails, the script stops FFmpeg cleanly, finalizes the MP4, and removes the
 temporary images. The output path must not already exist.
 
@@ -213,13 +231,48 @@ environment variables are unset, the script reads the API key from line 1 and
 the endpoint from line 3 of the ignored local `ast` file. Set
 `COMPUTERUSE_CREDENTIALS` to use a different credentials file.
 
+### Video Acceleration
+
+Recording and offline frame extraction use FFmpeg's VA-API support when a
+working Intel or AMD render node is available. This uses the GPU's video engine
+for supported H.264 encoding and video decoding. X11 capture, PNG observations,
+PNG output, and the remote vision model remain CPU or remote operations; this
+does not run the model locally or add general-purpose GPU acceleration.
+
+| Environment variable | Behavior |
+| --- | --- |
+| `COMPUTERUSE_VIDEO_ACCEL=auto` | Default. Try accessible VA-API devices, then report and use software if none works. |
+| `COMPUTERUSE_VIDEO_ACCEL=vaapi` | Require VA-API and fail with the FFmpeg diagnostic if it cannot be used. |
+| `COMPUTERUSE_VIDEO_ACCEL=off` | Use software without probing render nodes. |
+| `COMPUTERUSE_VAAPI_DEVICE=/dev/dri/renderD128` | Try only this render node; never substitute another device. |
+
+The FFmpeg build must include VA-API support and the appropriate Mesa or Intel
+media driver must be installed. The user running `computeruse` needs read and
+write permission on the selected `/dev/dri/renderD*` node, commonly through the
+`render` group. The program does not install drivers, change permissions, or
+require root. `vainfo --display drm --device /dev/dri/renderD128` is useful for
+checking driver profiles but is not required at runtime.
+
+Render-node numbers do not identify integrated GPUs. On a multi-GPU machine,
+inspect `udevadm info --query=property --name=/dev/dri/renderD128` and the
+corresponding `/sys/class/drm/renderD128/device` link, or compare devices with
+`lspci -k`, then set `COMPUTERUSE_VAAPI_DEVICE` explicitly. The selected mode,
+device, and any software fallback are printed to stderr.
+
+Recording performs a short, bounded H.264 encode preflight at the actual screen
+size. Automatic fallback is limited to that preflight; a capture failure after
+startup stops the agent and is reported so stale observations are never used.
+Offline extraction validates decoding against the input itself. In `auto`, a
+failed hardware decode removes its numbered partial frames and retries once in
+software while preserving unrelated files in the output directory.
+
 The default model is `gpt-6-astra`; override it with `--model` for the name
 exposed by your endpoint. Unless `--frame-output` is supplied, extracted frames
 are kept in a temporary directory and removed when the command exits. The
-agent processes one video frame per step in offline mode. In live mode,
-`--frame-timeout-ms` controls how long it waits for a new observation and
-defaults to 10 seconds. `--execute` is deliberately required for input
-injection.
+agent samples videos at 2 FPS and processes one sampled frame per step in
+offline mode. In live mode, `--frame-timeout-ms` controls how long it waits for
+a new observation and defaults to 10 seconds. `--execute` is deliberately
+required for input injection.
 Policy actions are atomic key taps/hotkeys and mouse clicks rather than
 persistent holds. Each decision is limited to 16 actions, relative movement to
 32767 units per axis, scrolling to 100 units, and waits to 30 seconds.

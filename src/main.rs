@@ -2,9 +2,9 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use computeruse::{
     Action, Button, Controller, Frame, FrameSequence, FrameSource, GptAstraPolicy, Key, KeyState,
-    KeyboardController, KeyboardEvent, KeyboardListener, KeyboardPlaybackFilter, LinuxKeyboard,
-    LinuxMouse, Listener, MouseEvent, MouseTrajectory, PlaybackFilter, Point, Policy, Transition,
-    X11ButtonListener, X11Cursor, extract_video_frames,
+    KeyboardBackend, KeyboardController, KeyboardEvent, KeyboardListener, KeyboardPlaybackFilter,
+    LinuxKeyboard, LinuxMouse, Listener, MouseBackend, MouseEvent, MouseTrajectory, PlaybackFilter,
+    Point, Policy, Transition, X11ButtonListener, X11Cursor, extract_video_frames_sampled,
 };
 use serde::Serialize;
 use std::collections::VecDeque;
@@ -14,12 +14,13 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const ESCAPE_SCAN_CODE: u16 = 1;
 const HOME_X: i16 = 960;
 const HOME_Y: i16 = 540;
 const HOME_SCREEN: usize = 0;
+const AGENT_VIDEO_FRAMES_PER_SECOND: u32 = 2;
 
 #[derive(Parser)]
 #[command(version, about)]
@@ -391,7 +392,12 @@ fn run_agent(options: AgentOptions) -> Result<()> {
                     .map(|directory| directory.path.as_path())
             })
             .expect("a video frame output exists");
-        let paths = extract_video_frames(video, frame_output)?;
+        let paths = extract_video_frames_sampled(
+            video,
+            frame_output,
+            AGENT_VIDEO_FRAMES_PER_SECOND,
+            options.max_steps,
+        )?;
         AgentFrameSource::Video(FrameSequence::new(paths, options.trajectory)?)
     };
     let policy = GptAstraPolicy::from_env(options.model)?;
@@ -429,15 +435,25 @@ fn run_agent(options: AgentOptions) -> Result<()> {
             .expect("trajectory has a new frame")
             .path
             .clone();
+        let policy_started = Instant::now();
         let decision = policy.decide(&instructions, trajectory, &transitions)?;
-        if decision.actions.len() > 16 {
-            bail!("policy proposed more than 16 actions in one step");
-        }
-        validate_actions(&decision.actions)?;
-        if let Some((mouse, keyboard)) = &mut devices {
+        let policy_elapsed = policy_started.elapsed();
+        let input_elapsed = if let Some((mouse, keyboard)) = &mut devices {
+            let input_started = Instant::now();
             execute_actions(mouse, keyboard, &decision.actions)?;
+            let elapsed = input_started.elapsed();
             frames.discard_live_frames()?;
-        }
+            elapsed
+        } else {
+            validate_actions(&decision.actions)?;
+            Duration::ZERO
+        };
+        eprintln!(
+            "agent step {step}: policy={} ms, input={:.3} ms{}",
+            policy_elapsed.as_millis(),
+            input_elapsed.as_secs_f64() * 1000.0,
+            if options.execute { "" } else { " (dry run)" }
+        );
         let progress = decision.progress.clamp(0.0, 1.0);
         let transition = Transition {
             step,
@@ -462,11 +478,16 @@ fn run_agent(options: AgentOptions) -> Result<()> {
     bail!("agent reached max steps without completing the instructions")
 }
 
-fn execute_actions(
-    mouse: &mut Controller<LinuxMouse>,
-    keyboard: &mut KeyboardController<LinuxKeyboard>,
+fn execute_actions<M: MouseBackend, K: KeyboardBackend>(
+    mouse: &mut Controller<M>,
+    keyboard: &mut KeyboardController<K>,
     actions: &[Action],
-) -> Result<()> {
+) -> Result<()>
+where
+    M::Error: std::error::Error + Send + Sync + 'static,
+    K::Error: std::fmt::Display,
+{
+    validate_actions(actions)?;
     for action in actions {
         match action {
             Action::MouseMove { dx, dy } => mouse.move_relative(*dx, *dy)?,
@@ -478,10 +499,12 @@ fn execute_actions(
             Action::Scroll { delta, .. } => mouse.wheel(*delta)?,
             Action::KeyTap { key } => keyboard.send_hotkey(key).map_err(anyhow::Error::msg)?,
             Action::Hotkey { keys } => keyboard.send_hotkey(keys).map_err(anyhow::Error::msg)?,
-            Action::Wait { milliseconds } => {
-                if *milliseconds > 30_000 {
-                    bail!("policy wait action exceeds 30 seconds");
+            Action::KeySequence { keys } => {
+                for key in keys {
+                    keyboard.send_hotkey(key).map_err(anyhow::Error::msg)?;
                 }
+            }
+            Action::Wait { milliseconds } => {
                 thread::sleep(Duration::from_millis(*milliseconds));
             }
         }
@@ -490,6 +513,9 @@ fn execute_actions(
 }
 
 fn validate_actions(actions: &[Action]) -> Result<()> {
+    if actions.len() > 16 {
+        bail!("policy proposed more than 16 actions in one step");
+    }
     for action in actions {
         match action {
             Action::MouseMove { dx, dy }
@@ -504,19 +530,14 @@ fn validate_actions(actions: &[Action]) -> Result<()> {
                 validate_policy_key(key)?;
             }
             Action::Hotkey { keys } => {
-                let parsed = keys
-                    .split('+')
-                    .map(str::parse::<Key>)
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(anyhow::Error::msg)?;
-                if parsed.is_empty() {
-                    bail!("policy hotkey cannot be empty");
+                validate_policy_hotkey(keys)?;
+            }
+            Action::KeySequence { keys } => {
+                if keys.is_empty() || keys.len() > 256 {
+                    bail!("policy key sequence must contain 1..256 keys");
                 }
-                if let Some(key) = parsed
-                    .iter()
-                    .find(|key| !LinuxKeyboard::supports_scan_code(key.scan_code))
-                {
-                    bail!("policy key is not injectable on Linux: {key}");
+                for key in keys {
+                    validate_policy_hotkey(key)?;
                 }
             }
             Action::Wait { milliseconds } if *milliseconds > 30_000 => {
@@ -524,6 +545,13 @@ fn validate_actions(actions: &[Action]) -> Result<()> {
             }
             _ => {}
         }
+    }
+    Ok(())
+}
+
+fn validate_policy_hotkey(value: &str) -> Result<()> {
+    for key in value.split('+') {
+        validate_policy_key(key)?;
     }
     Ok(())
 }
@@ -643,6 +671,105 @@ fn println_json(event: &impl Serialize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use computeruse::ButtonState;
+    use std::convert::Infallible;
+
+    struct NoMouse;
+
+    impl MouseBackend for NoMouse {
+        type Error = Infallible;
+
+        fn button(&mut self, _: Button, _: ButtonState) -> Result<(), Self::Error> {
+            unreachable!("keyboard actions must not emit mouse events")
+        }
+
+        fn move_relative(&mut self, _: i32, _: i32) -> Result<(), Self::Error> {
+            unreachable!("keyboard actions must not emit mouse events")
+        }
+
+        fn move_absolute(&mut self, _: u16, _: u16) -> Result<(), Self::Error> {
+            unreachable!("keyboard actions must not emit mouse events")
+        }
+
+        fn wheel(&mut self, _: i32, _: bool) -> Result<(), Self::Error> {
+            unreachable!("keyboard actions must not emit mouse events")
+        }
+    }
+
+    struct RecordingKeyboard<'a>(&'a mut Vec<(u16, KeyState)>);
+
+    impl KeyboardBackend for RecordingKeyboard<'_> {
+        type Error = Infallible;
+
+        fn key(&mut self, scan_code: u16, state: KeyState) -> Result<(), Self::Error> {
+            self.0.push((scan_code, state));
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn key_sequence_emits_each_tap_once_and_preserves_double_letters() {
+        let mut events = Vec::new();
+        let mut mouse = Controller::new(NoMouse);
+        let mut keyboard = KeyboardController::new(RecordingKeyboard(&mut events));
+        let mut keys: Vec<String> = "hello.realestate.com.au"
+            .chars()
+            .map(|key| key.to_string())
+            .collect();
+        keys.push("shift+a".into());
+
+        execute_actions(&mut mouse, &mut keyboard, &[Action::KeySequence { keys }]).unwrap();
+
+        let mut expected: Vec<_> = [
+            35, 18, 38, 38, 24, 52, 19, 18, 30, 38, 18, 31, 20, 30, 20, 18, 52, 46, 24, 50, 52, 30,
+            22,
+        ]
+        .into_iter()
+        .flat_map(|code| [(code, KeyState::Down), (code, KeyState::Up)])
+        .collect();
+        expected.extend([
+            (42, KeyState::Down),
+            (30, KeyState::Down),
+            (30, KeyState::Up),
+            (42, KeyState::Up),
+        ]);
+        assert_eq!(events, expected);
+    }
+
+    #[test]
+    fn invalid_sequence_prevents_all_actions_from_executing() {
+        let mut events = Vec::new();
+        let mut mouse = Controller::new(NoMouse);
+        let mut keyboard = KeyboardController::new(RecordingKeyboard(&mut events));
+        let actions = [
+            Action::KeyTap { key: "a".into() },
+            Action::KeySequence {
+                keys: vec!["b".into(), "ctrl+code:65535".into()],
+            },
+        ];
+
+        assert!(execute_actions(&mut mouse, &mut keyboard, &actions).is_err());
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn key_sequences_are_bounded_and_validate_every_hotkey() {
+        for keys in [
+            vec![],
+            vec!["a".into(); 257],
+            vec!["a".into(), "".into()],
+            vec!["a".into(), "ctrl+unknown".into()],
+        ] {
+            assert!(validate_actions(&[Action::KeySequence { keys }]).is_err());
+        }
+        assert!(
+            validate_actions(&[Action::KeySequence {
+                keys: vec!["a".into(); 256],
+            }])
+            .is_ok()
+        );
+        assert!(validate_actions(&vec![Action::KeyTap { key: "a".into() }; 17]).is_err());
+    }
 
     #[test]
     fn agent_actions_are_validated_before_execution() {

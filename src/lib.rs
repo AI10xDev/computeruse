@@ -24,7 +24,7 @@ pub use keyboard::{
     Key, KeyState, KeyboardBackend, KeyboardController, KeyboardEvent, KeyboardPlaybackFilter,
 };
 pub use trajectory::{MouseTrajectory, Point, Segment, TrajectoryError, Turn};
-pub use video::extract_video_frames;
+pub use video::{extract_video_frames, extract_video_frames_sampled};
 
 #[cfg(target_os = "linux")]
 pub use linux::{KeyboardListener, LinuxKeyboard, LinuxMouse, Listener};

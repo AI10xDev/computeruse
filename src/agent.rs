@@ -68,7 +68,7 @@ impl FrameSource {
         })
     }
 
-    /// Ignore frames that already exist, so the next observation is produced after this call.
+    /// Drop prior visual context and ignore frames already published before this call.
     pub fn discard_existing(&mut self) -> Result<()> {
         for entry in fs::read_dir(&self.directory)? {
             let path = entry?.path();
@@ -76,6 +76,7 @@ impl FrameSource {
                 self.discarded_paths.insert(path);
             }
         }
+        self.trajectory.clear();
         Ok(())
     }
 
@@ -247,6 +248,7 @@ pub enum Action {
     Scroll { delta: i32, horizontal: bool },
     KeyTap { key: String },
     Hotkey { keys: String },
+    KeySequence { keys: Vec<String> },
     Wait { milliseconds: u64 },
 }
 
@@ -372,16 +374,38 @@ impl Policy for GptAstraPolicy {
         );
         let mut content = vec![json!({ "type": "text", "text": prompt })];
         for (index, frame) in trajectory.iter().enumerate() {
+            let state = if index + 1 == trajectory.len() {
+                "Current observation (newest frame)"
+            } else {
+                "Historical observation (not the current state)"
+            };
             content.push(json!({
                 "type": "text",
-                "text": format!("Trajectory frame {index}: {}", frame.path.display())
+                "text": format!("{state}, frame {index}: {}", frame.path.display())
             }));
             content.push(json!({
                 "type": "image_url",
                 "image_url": { "url": frame.data_url(), "detail": "high" }
             }));
         }
-        let system = "Act as a cautious GUI policy. Infer state changes from the ordered frames and return JSON only. Use normalized 0..65535 coordinates for mouse_move_to. Prefer one small, reversible action per observation. Never invent an action type. Set completed only when the latest frame visibly proves the instructions are complete. Output: {\"rationale\":string,\"actions\":[action],\"completed\":bool,\"progress\":number}. Every action must be a flat object with a required \"type\" field, for example {\"type\":\"mouse_move_to\",\"x\":1800,\"y\":800}; do not use {\"mouse_move_to\":{...}}. Valid type/field sets: mouse_move(dx,dy), mouse_move_to(x,y), mouse_click(button), scroll(delta,horizontal), key_tap(key), hotkey(keys), wait(milliseconds). Buttons: left, right, middle, side, extra. Named keys and hotkeys use forms such as enter, tab, escape, ctrl+shift+a. Relative movement is limited to +/-32767, scrolling to +/-100, and waits to 30000 milliseconds.";
+        let system = concat!(
+            "Act as a cautious GUI policy. Infer state changes from the ordered frames and return JSON only. ",
+            "Only the newest frame represents the current state; earlier frames are historical. ",
+            "Previous transitions with executed=true record actions already sent, not instructions to replay. ",
+            "Do not retype executed keys just because visual feedback is delayed; wait for a fresh observation before correcting input. ",
+            "Use normalized 0..65535 coordinates for mouse_move_to. Prefer one small, reversible action per observation for navigation. ",
+            "For known text in a focused field, use key_sequence to batch typing in one decision instead of requesting a decision for every letter. ",
+            "Each sequence entry is a named key or hotkey, tapped once in order without observation delays. Preserve intentional repeated letters. ",
+            "For example, {\"type\":\"key_sequence\",\"keys\":[\"h\",\"e\",\"l\",\"l\",\"o\",\"dot\"]} types hello. on a matching keyboard layout. ",
+            "Observe focus changes before typing; do not combine navigation and speculative typing in one sequence. ",
+            "Never invent an action type. Set completed only when the latest frame visibly proves the instructions are complete. ",
+            "Output: {\"rationale\":string,\"actions\":[action],\"completed\":bool,\"progress\":number}. ",
+            "Every action must be a flat object with a required \"type\" field, for example {\"type\":\"mouse_move_to\",\"x\":1800,\"y\":800}; do not use {\"mouse_move_to\":{...}}. ",
+            "Valid type/field sets: mouse_move(dx,dy), mouse_move_to(x,y), mouse_click(button), scroll(delta,horizontal), key_tap(key), hotkey(keys), key_sequence(keys), wait(milliseconds). ",
+            "Buttons: left, right, middle, side, extra. Named keys and hotkeys use forms such as enter, tab, escape, ctrl+shift+a. ",
+            "Use shift+a for an uppercase A. key_sequence.keys is an array of 1..256 key/hotkey strings; hotkey.keys is one string. ",
+            "Return at most 16 actions per decision. Relative movement is limited to +/-32767, scrolling to +/-100, and waits to 30000 milliseconds."
+        );
         let (body, azure) = match self.api_kind {
             ApiKind::ChatCompletions => (
                 json!({
@@ -472,13 +496,14 @@ fn parse_decision(content: &str) -> Result<AgentDecision, serde_json::Error> {
 }
 
 fn normalize_externally_tagged_actions(value: &mut Value) {
-    const ACTION_TYPES: [&str; 7] = [
+    const ACTION_TYPES: [&str; 8] = [
         "mouse_move",
         "mouse_move_to",
         "mouse_click",
         "scroll",
         "key_tap",
         "hotkey",
+        "key_sequence",
         "wait",
     ];
 
@@ -517,15 +542,24 @@ mod tests {
     fn action_protocol_round_trips() {
         let decision = AgentDecision {
             rationale: "focus the field".into(),
-            actions: vec![Action::Hotkey {
-                keys: "ctrl+l".into(),
-            }],
+            actions: vec![
+                Action::Hotkey {
+                    keys: "ctrl+l".into(),
+                },
+                Action::KeySequence {
+                    keys: vec!["l".into(), "l".into(), "shift+a".into()],
+                },
+            ],
             completed: false,
             progress: 0.25,
         };
         let json = serde_json::to_string(&decision).unwrap();
         let parsed: AgentDecision = serde_json::from_str(&json).unwrap();
         assert!(matches!(parsed.actions[0], Action::Hotkey { .. }));
+        assert!(matches!(
+            &parsed.actions[1],
+            Action::KeySequence { keys } if keys == &["l", "l", "shift+a"]
+        ));
     }
 
     #[test]
@@ -545,12 +579,16 @@ mod tests {
     #[test]
     fn accepts_externally_tagged_policy_actions() {
         let decision = parse_decision(
-            r#"{"rationale":"move","actions":[{"mouse_move_to":{"x":1800,"y":800}}],"completed":false,"progress":0.5}"#,
+            r#"{"rationale":"move","actions":[{"mouse_move_to":{"x":1800,"y":800}},{"key_sequence":{"keys":["a","a"]}}],"completed":false,"progress":0.5}"#,
         )
         .unwrap();
         assert!(matches!(
             decision.actions[0],
             Action::MouseMoveTo { x: 1800, y: 800 }
+        ));
+        assert!(matches!(
+            &decision.actions[1],
+            Action::KeySequence { keys } if keys == &["a", "a"]
         ));
     }
 
@@ -624,7 +662,8 @@ mod tests {
         let stale = directory.join("001.png");
         fs::write(&stale, fake_png(b's')).unwrap();
 
-        let mut source = FrameSource::new(&directory, 1).unwrap();
+        let mut source = FrameSource::new(&directory, 3).unwrap();
+        assert_eq!(source.next(Duration::ZERO).unwrap().unwrap().len(), 1);
         source.discard_existing().unwrap();
         fs::write(&stale, fake_png(b'x')).unwrap();
         assert!(source.next(Duration::ZERO).unwrap().is_none());
@@ -632,6 +671,7 @@ mod tests {
         let fresh = directory.join("002.png");
         fs::write(&fresh, fake_png(b'f')).unwrap();
         let trajectory = source.next(Duration::ZERO).unwrap().unwrap();
+        assert_eq!(trajectory.len(), 1);
         assert_eq!(trajectory.back().unwrap().path, fresh);
 
         fs::remove_dir_all(directory).unwrap();
