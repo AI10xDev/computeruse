@@ -150,6 +150,15 @@ trajectory and prior transitions, then emits typed mouse, keyboard, scroll, or
 wait actions. The transition log includes the policy's progress estimate and
 its change as a reward signal for evaluation or offline reinforcement learning.
 
+Use `{"type":"focus_window","class":"firefox"}` to activate an existing
+Firefox window on native X11. Unlike a taskbar click or Alt+Tab, this is
+idempotent: an active window stays active and its size is unchanged. Activation
+waits for the window manager to report the target active and viewable. The class
+matches either WM_CLASS field exactly (case-insensitive); missing or ambiguous
+inactive matches fail safely. This action must stand alone so the next decision
+observes the activated window before typing. It does not launch applications
+and requires native X11 even with `--mouse-control direct`.
+
 For typing into a focused field, the policy can emit a `key_sequence` action
 with 1 to 256 named keys or hotkeys. The entire sequence is validated before any
 actions execute, then each entry is pressed and released once locally without
@@ -249,12 +258,21 @@ also sampling temporary observations at 2 FPS. The agent watches those images
 through `--frames`, but requests are serialized: Astra receives one bounded
 frame trajectory per policy decision, not a continuous 2 FPS stream. After an
 executed action, already-published frames and the in-memory screenshot history
-are discarded. The next decision waits for newly published images instead of
-reusing pre-action visual context. Publication does not guarantee the GUI has
-finished rendering, so the policy is instructed to wait for delayed feedback
-rather than blindly retype executed keys. When the agent completes or
+are discarded. Images must have modification times later than a 750 ms settling
+interval; late renames of earlier images are ignored. With trajectory length
+two or greater, the next decision waits for at least two post-settle images.
+This is a bounded settling allowance, not proof of page readiness or a capture
+timestamp guarantee from external producers. The policy must still wait when
+the newest images show loading or a transition, rather than repeating input.
+Transitions include the decision rationale; completion after input requires
+another observation. When the agent completes or
 fails, the script stops FFmpeg cleanly, finalizes the MP4, and removes the
 temporary images. The output path must not already exist.
+
+Recording uses fragmented MP4 with an initial index, keyframes every two seconds,
+and flushed fragments. An interrupted file can retain completed fragments even
+without normal finalization; the last unfinished fragment can still be lost.
+Software recordings use browser-compatible `yuv420p` rather than `yuv444p`.
 
 ```bash
 printf '%s\n' 'Open the browser settings page.' > gui-steps.txt

@@ -8,9 +8,10 @@ use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 const MAX_FRAME_BYTES: u64 = 20 * 1024 * 1024;
+const POST_ACTION_SETTLE: Duration = Duration::from_millis(750);
 
 #[derive(Clone, Debug)]
 pub struct Frame {
@@ -35,6 +36,7 @@ pub struct FrameSource {
     discarded_paths: HashSet<PathBuf>,
     trajectory: VecDeque<Frame>,
     trajectory_len: usize,
+    not_before: Option<SystemTime>,
 }
 
 /// An ordered, finite source used for frame-by-frame processing of a video.
@@ -65,11 +67,13 @@ impl FrameSource {
             discarded_paths: HashSet::new(),
             trajectory: VecDeque::new(),
             trajectory_len,
+            not_before: None,
         })
     }
 
-    /// Drop prior visual context and ignore frames already published before this call.
+    /// Ignore images written before the settling cutoff, including late renames.
     pub fn discard_existing(&mut self) -> Result<()> {
+        self.not_before = Some(SystemTime::now() + POST_ACTION_SETTLE);
         for entry in fs::read_dir(&self.directory)? {
             let path = entry?.path();
             if media_type(&path).is_some() {
@@ -104,7 +108,11 @@ impl FrameSource {
                     while self.trajectory.len() > self.trajectory_len {
                         self.trajectory.pop_front();
                     }
-                    return Ok(Some(&self.trajectory));
+                    if self.not_before.is_none()
+                        || self.trajectory.len() >= self.trajectory_len.min(2)
+                    {
+                        return Ok(Some(&self.trajectory));
+                    }
                 }
             }
             if Instant::now() >= deadline {
@@ -124,6 +132,9 @@ impl FrameSource {
                     modified: metadata.modified().ok(),
                 };
                 (media_type(&path).is_some()
+                    && self.not_before.is_none_or(|cutoff| {
+                        identity.modified.is_some_and(|modified| modified > cutoff)
+                    })
                     && !self.discarded_paths.contains(&path)
                     && self.seen.get(&path) != Some(&identity))
                 .then_some((path, identity))
@@ -242,6 +253,7 @@ fn media_type(path: &Path) -> Option<&'static str> {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Action {
+    FocusWindow { class: String },
     MouseMove { dx: i32, dy: i32 },
     MouseMoveTo { x: u16, y: u16 },
     MouseClick { button: crate::Button },
@@ -273,6 +285,7 @@ pub struct Transition {
     pub reward: f32,
     pub completed: bool,
     pub executed: bool,
+    pub rationale: String,
     /// One measured report per controlled mouse_move_to, in action order.
     /// Empty for dry runs or unverified direct movement.
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -397,6 +410,11 @@ impl Policy for GptAstraPolicy {
             "Only the newest frame represents the current state; earlier frames are historical. ",
             "Previous transitions with executed=true record actions already sent, not instructions to replay. ",
             "Do not retype executed keys just because visual feedback is delayed; wait for a fresh observation before correcting input. ",
+            "For an already running application, use focus_window with its WM_CLASS (Firefox: firefox), never repeated taskbar clicks or alt+tab. ",
+            "focus_window is idempotent: it activates/restores without toggling minimization or maximization. It must be the only action in its decision. ",
+            "If the intended application is already visible and active, continue the task rather than activating it again. Do not maximize, minimize, or resize windows unless requested. ",
+            "After focus/navigation, compare the newest observations; if they still show a transition, wait rather than repeat the action. ",
+            "A Firefox Restore Session error is not a reason to toggle windows or restore unrelated tabs: for a requested URL, focus the address bar with ctrl+l, observe focus, then type the URL and Enter. ",
             "Use mouse_move_to for precision targets. Its coordinates are normalized 0..65535, NOT screenshot pixels: x=round(pixel_x*65535/(width-1)), y=round(pixel_y*65535/(height-1)). ",
             "mouse_move uses raw device counts, which are not screen pixels and can be affected by acceleration. ",
             "When present, cursor_motion reports measured desktop pixels, residual error, and velocity in pixels/second. Cursor arrival does not prove a click or page change succeeded. ",
@@ -409,7 +427,7 @@ impl Policy for GptAstraPolicy {
             "Never invent an action type. Set completed only when the latest frame visibly proves the instructions are complete. ",
             "Output: {\"rationale\":string,\"actions\":[action],\"completed\":bool,\"progress\":number}. ",
             "Every action must be a flat object with a required \"type\" field, for example {\"type\":\"mouse_move_to\",\"x\":32768,\"y\":32768} targets the desktop center; do not use {\"mouse_move_to\":{...}}. ",
-            "Valid type/field sets: mouse_move(dx,dy), mouse_move_to(x,y), mouse_click(button), scroll(delta,horizontal), key_tap(key), hotkey(keys), key_sequence(keys), wait(milliseconds). ",
+            "Valid type/field sets: focus_window(class), mouse_move(dx,dy), mouse_move_to(x,y), mouse_click(button), scroll(delta,horizontal), key_tap(key), hotkey(keys), key_sequence(keys), wait(milliseconds). ",
             "Buttons: left, right, middle, side, extra. Named keys and hotkeys use forms such as enter, tab, escape, ctrl+shift+a. ",
             "Use shift+a for an uppercase A. key_sequence.keys is an array of 1..256 key/hotkey strings; hotkey.keys is one string. ",
             "Return at most 16 actions per decision. Relative movement is limited to +/-32767, scrolling to +/-100, and waits to 30000 milliseconds."
@@ -504,7 +522,8 @@ fn parse_decision(content: &str) -> Result<AgentDecision, serde_json::Error> {
 }
 
 fn normalize_externally_tagged_actions(value: &mut Value) {
-    const ACTION_TYPES: [&str; 8] = [
+    const ACTION_TYPES: [&str; 9] = [
+        "focus_window",
         "mouse_move",
         "mouse_move_to",
         "mouse_click",
@@ -557,6 +576,9 @@ mod tests {
                 Action::KeySequence {
                     keys: vec!["l".into(), "l".into(), "shift+a".into()],
                 },
+                Action::FocusWindow {
+                    class: "firefox".into(),
+                },
             ],
             completed: false,
             progress: 0.25,
@@ -567,6 +589,10 @@ mod tests {
         assert!(matches!(
             &parsed.actions[1],
             Action::KeySequence { keys } if keys == &["l", "l", "shift+a"]
+        ));
+        assert!(matches!(
+            &parsed.actions[2],
+            Action::FocusWindow { class } if class == "firefox"
         ));
     }
 
@@ -672,15 +698,47 @@ mod tests {
 
         let mut source = FrameSource::new(&directory, 3).unwrap();
         assert_eq!(source.next(Duration::ZERO).unwrap().unwrap().len(), 1);
+        let before = SystemTime::now();
         source.discard_existing().unwrap();
+        let cutoff = source.not_before.unwrap();
+        assert!(cutoff >= before + POST_ACTION_SETTLE);
         fs::write(&stale, fake_png(b'x')).unwrap();
+        assert!(source.next(Duration::ZERO).unwrap().is_none());
+
+        // Atomic rename must not turn an image written before the barrier fresh.
+        let pending = directory.join("pending.tmp");
+        fs::write(&pending, fake_png(b'p')).unwrap();
+        File::options()
+            .write(true)
+            .open(&pending)
+            .unwrap()
+            .set_modified(cutoff - Duration::from_millis(1))
+            .unwrap();
+        fs::rename(pending, directory.join("late.png")).unwrap();
         assert!(source.next(Duration::ZERO).unwrap().is_none());
 
         let fresh = directory.join("002.png");
         fs::write(&fresh, fake_png(b'f')).unwrap();
+        File::options()
+            .write(true)
+            .open(&fresh)
+            .unwrap()
+            .set_modified(cutoff + Duration::from_millis(1))
+            .unwrap();
+        // One frame may still show a transition. Wait for a second observation.
+        assert!(source.next(Duration::ZERO).unwrap().is_none());
+        let settled = directory.join("003.png");
+        fs::write(&settled, fake_png(b'g')).unwrap();
+        File::options()
+            .write(true)
+            .open(&settled)
+            .unwrap()
+            .set_modified(cutoff + Duration::from_millis(2))
+            .unwrap();
         let trajectory = source.next(Duration::ZERO).unwrap().unwrap();
-        assert_eq!(trajectory.len(), 1);
-        assert_eq!(trajectory.back().unwrap().path, fresh);
+        assert_eq!(trajectory.len(), 2);
+        assert_eq!(trajectory[0].path, fresh);
+        assert_eq!(trajectory.back().unwrap().path, settled);
 
         fs::remove_dir_all(directory).unwrap();
     }

@@ -2,11 +2,13 @@ use crate::{Button, ButtonState, CursorBackend, MouseEvent, Point};
 use anyhow::{Context, Result, ensure};
 use std::fmt;
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use x11rb::connection::Connection;
 use x11rb::protocol::Event;
 use x11rb::protocol::xinput::{self, ConnectionExt as _};
-use x11rb::protocol::xproto::{ConnectionExt, Window};
+use x11rb::protocol::xproto::{
+    AtomEnum, ClientMessageEvent, ConnectionExt, EventMask, MapState, Window,
+};
 
 const POLL_INTERVAL: Duration = Duration::from_millis(2);
 
@@ -184,6 +186,101 @@ impl X11Cursor {
         )
     }
 
+    /// Activates an exact, ASCII-case-insensitive WM_CLASS instance or class match.
+    /// An active match wins; multiple inactive matches are an error. Success requires
+    /// the window manager to report the target as both active and viewable.
+    pub fn focus_window(&mut self, class: &str) -> Result<()> {
+        ensure!(
+            !class.is_empty() && !class.contains('\0'),
+            "window class must be nonempty and contain no NUL bytes"
+        );
+        let atom = |name: &[u8]| -> Result<u32> {
+            let atom = self.connection.intern_atom(true, name)?.reply()?.atom;
+            ensure!(
+                atom != x11rb::NONE,
+                "window manager does not provide EWMH {}",
+                String::from_utf8_lossy(name)
+            );
+            Ok(atom)
+        };
+        let client_list = atom(b"_NET_CLIENT_LIST")?;
+        let active_window = atom(b"_NET_ACTIVE_WINDOW")?;
+        let windows = |property, name: &str| -> Result<Vec<Window>> {
+            let reply = self
+                .connection
+                .get_property(false, self.root, property, AtomEnum::WINDOW, 0, u32::MAX)?
+                .reply()
+                .with_context(|| format!("cannot read EWMH {name}"))?;
+            ensure!(
+                reply.type_ == u32::from(AtomEnum::WINDOW) && reply.format == 32,
+                "window manager has missing or invalid EWMH {name}"
+            );
+            Ok(reply.value32().unwrap().collect())
+        };
+        let active = || -> Result<Window> {
+            let value = windows(active_window, "_NET_ACTIVE_WINDOW")?;
+            ensure!(value.len() == 1, "invalid EWMH _NET_ACTIVE_WINDOW length");
+            Ok(value[0])
+        };
+        let mut matches = Vec::new();
+        for window in windows(client_list, "_NET_CLIENT_LIST")? {
+            let reply = self
+                .connection
+                .get_property(
+                    false,
+                    window,
+                    AtomEnum::WM_CLASS,
+                    AtomEnum::STRING,
+                    0,
+                    u32::MAX,
+                )?
+                .reply()
+                .with_context(|| format!("cannot read WM_CLASS for window {window:#x}"))?;
+            if reply.type_ == u32::from(AtomEnum::STRING)
+                && reply.format == 8
+                && wm_class_matches(&reply.value, class)
+            {
+                matches.push(window);
+            }
+        }
+        let current = active()?;
+        let target = matching_window(&matches, current, class)?;
+        if let Some(request) = activation_request(target, active_window, current) {
+            self.connection
+                .send_event(
+                    false,
+                    self.root,
+                    EventMask::SUBSTRUCTURE_REDIRECT | EventMask::SUBSTRUCTURE_NOTIFY,
+                    request,
+                )
+                .context("cannot send EWMH window activation request")?
+                .check()
+                .context("X11 rejected EWMH window activation request")?;
+            self.connection
+                .flush()
+                .context("cannot flush EWMH window activation request")?;
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let attributes = self
+                .connection
+                .get_window_attributes(target)?
+                .reply()
+                .with_context(|| {
+                    format!("cannot inspect activation target {target:#x} ({class:?})")
+                })?;
+            if active()? == target && attributes.map_state == MapState::VIEWABLE {
+                return Ok(());
+            }
+            ensure!(
+                Instant::now() < deadline,
+                "timed out waiting for window {target:#x} ({class:?}) to become active and viewable; window manager did not acknowledge activation"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
     /// X11 equivalent of `xdotool getmouselocation`.
     pub fn location(&self) -> Result<CursorLocation> {
         let reply = self
@@ -244,6 +341,36 @@ impl X11Cursor {
     }
 }
 
+fn wm_class_matches(value: &[u8], class: &str) -> bool {
+    !class.is_empty()
+        && value
+            .split(|byte| *byte == 0)
+            .take(2)
+            .any(|field| field.eq_ignore_ascii_case(class.as_bytes()))
+}
+
+fn matching_window(matches: &[Window], active: Window, class: &str) -> Result<Window> {
+    if matches.contains(&active) {
+        return Ok(active);
+    }
+    ensure!(
+        !matches.is_empty(),
+        "no managed X11 window matches WM_CLASS {class:?}"
+    );
+    ensure!(
+        matches.len() == 1,
+        "ambiguous WM_CLASS {class:?}: {} windows match and none is active; use a unique instance or class",
+        matches.len()
+    );
+    Ok(matches[0])
+}
+
+fn activation_request(target: Window, atom: u32, active: Window) -> Option<ClientMessageEvent> {
+    // Pager source (2), CurrentTime, and the currently active window, per EWMH.
+    (target != active)
+        .then(|| ClientMessageEvent::new(32, target, atom, [2, x11rb::CURRENT_TIME, active, 0, 0]))
+}
+
 fn validate_native_x11(
     session_type: Option<&str>,
     xwayland: bool,
@@ -264,6 +391,10 @@ fn validate_native_x11(
 }
 
 impl CursorBackend for X11Cursor {
+    fn focus_window(&mut self, class: &str) -> Result<()> {
+        X11Cursor::focus_window(self, class)
+    }
+
     fn dimensions(&mut self) -> Result<(u16, u16)> {
         let geometry = self.connection.get_geometry(self.root)?.reply()?;
         ensure!(
@@ -301,6 +432,56 @@ impl CursorBackend for X11Cursor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn matches_exact_wm_class_instance_or_class_ignoring_ascii_case() {
+        for class in ["firefox", "FIREFOX", "Navigator", "navigator"] {
+            assert!(wm_class_matches(b"firefox\0Navigator\0", class));
+        }
+        assert!(wm_class_matches(b"firefox\0firefox\0", "Firefox"));
+        for class in ["", "fire", "fox", "firefox-esr", " firefox", "Other"] {
+            assert!(!wm_class_matches(b"firefox\0Navigator\0", class));
+        }
+        assert!(!wm_class_matches(b"other\0Other\0firefox\0", "firefox"));
+        assert!(!wm_class_matches(b"", "firefox"));
+    }
+
+    #[test]
+    fn selects_active_match_or_unique_match_but_never_arbitrary_window() {
+        assert_eq!(matching_window(&[10, 20], 20, "firefox").unwrap(), 20);
+        assert_eq!(matching_window(&[10], 30, "firefox").unwrap(), 10);
+        assert!(
+            matching_window(&[], 30, "firefox")
+                .unwrap_err()
+                .to_string()
+                .contains("no managed X11 window")
+        );
+        for matches in [&[10, 20][..], &[20, 10][..]] {
+            let error = matching_window(matches, 30, "firefox")
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("ambiguous WM_CLASS \"firefox\""));
+        }
+    }
+
+    #[test]
+    fn activation_is_idempotent_and_uses_ewmh_pager_request() {
+        assert!(activation_request(10, 99, 10).is_none());
+        for active in [x11rb::NONE, 20] {
+            let request = activation_request(10, 99, active).unwrap();
+            assert_eq!(
+                request.response_type,
+                x11rb::protocol::xproto::CLIENT_MESSAGE_EVENT
+            );
+            assert_eq!(request.format, 32);
+            assert_eq!(request.window, 10);
+            assert_eq!(request.type_, 99);
+            assert_eq!(
+                request.data.as_data32(),
+                [2, x11rb::CURRENT_TIME, active, 0, 0]
+            );
+        }
+    }
 
     #[test]
     fn native_x11_detection_handles_stale_and_missing_session_metadata() {

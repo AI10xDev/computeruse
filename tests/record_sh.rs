@@ -55,6 +55,26 @@ fn prepend_fake_path(command_path: &Path) -> String {
     )
 }
 
+fn assert_fragmented_mp4_output_scoping(recording: &str, output: &Path) {
+    let (input, outputs) = recording.split_once("-map\n0:v\n").unwrap();
+    let (mp4, png) = outputs.split_once(output.to_str().unwrap()).unwrap();
+    for option in [
+        "-g\n60\n",
+        "-movflags\n+empty_moov+default_base_moof+frag_keyframe\n",
+        "-flush_packets\n1\n",
+    ] {
+        assert!(mp4.contains(option), "missing MP4 option: {option}");
+        assert!(!input.contains(option), "MP4 option before input: {option}");
+    }
+    let png_args: Vec<_> = png.trim().lines().collect();
+    assert_eq!(png_args.len(), 7);
+    assert_eq!(
+        &png_args[..6],
+        &["-map", "0:v", "-vf", "fps=2", "-atomic_writing", "1"]
+    );
+    assert!(png_args[6].ends_with("/frame-%09d.png"));
+}
+
 #[test]
 fn auto_falls_back_only_during_preflight_and_preserves_output_scoping() {
     let sandbox = Sandbox::new("fallback");
@@ -110,6 +130,12 @@ sleep 0.2
     let log = fs::read_to_string(sandbox.path("ffmpeg.log")).unwrap();
     assert_eq!(log.matches("---").count(), 2);
     let recording_invocation = log.rsplit("---").next().unwrap();
+    let output = sandbox.path("recording.mp4");
+    assert_fragmented_mp4_output_scoping(recording_invocation, &output);
+    let (_, outputs) = recording_invocation.split_once("-map\n0:v\n").unwrap();
+    let (mp4, _) = outputs.split_once(output.to_str().unwrap()).unwrap();
+    assert!(mp4.contains("-pix_fmt\nyuv420p\n"));
+    assert!(!recording_invocation.contains("yuv444p"));
     assert!(recording_invocation.contains("libx264"));
     assert!(recording_invocation.contains("fps=2"));
     assert!(recording_invocation.contains("atomic_writing\n1"));
@@ -167,6 +193,7 @@ sleep 0.2
     );
     let log = fs::read_to_string(sandbox.path("ffmpeg.log")).unwrap();
     let recording = log.rsplit("---").next().unwrap();
+    assert_fragmented_mp4_output_scoping(recording, &output);
     let upload = recording.find("format=nv12,hwupload").unwrap();
     let encoder = recording.find("h264_vaapi").unwrap();
     let mp4 = recording.find(output.to_str().unwrap()).unwrap();
@@ -177,6 +204,7 @@ sleep 0.2
     );
     assert!(!recording.contains("libx264"));
     assert!(!recording.contains("veryfast"));
+    assert!(!recording.contains("-pix_fmt"));
 }
 
 #[test]

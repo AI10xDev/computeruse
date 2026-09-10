@@ -471,7 +471,11 @@ fn run_agent(options: AgentOptions) -> Result<()> {
             .path
             .clone();
         let policy_started = Instant::now();
-        let decision = policy.decide(&instructions, trajectory, &transitions)?;
+        let mut decision = policy.decide(&instructions, trajectory, &transitions)?;
+        // An action's requested outcome is not proof that it actually happened.
+        if options.execute && !decision.actions.is_empty() {
+            decision.completed = false;
+        }
         let policy_elapsed = policy_started.elapsed();
         let (input_elapsed, cursor_motion) = if let Some((mouse, keyboard)) = &mut devices {
             let input_started = Instant::now();
@@ -505,6 +509,7 @@ fn run_agent(options: AgentOptions) -> Result<()> {
             reward: progress - previous_progress,
             completed: decision.completed,
             executed: options.execute,
+            rationale: decision.rationale,
             cursor_motion,
         };
         previous_progress = progress;
@@ -535,6 +540,15 @@ where
     let mut cursor_motion = Vec::new();
     for action in actions {
         match action {
+            Action::FocusWindow { class } => {
+                if let Some(cursor) = cursor.as_deref_mut() {
+                    cursor.focus_window(class)?;
+                } else {
+                    let mut window = X11Cursor::connect_default()?;
+                    window.require_native_x11()?;
+                    window.focus_window(class)?;
+                }
+            }
             Action::MouseMove { dx, dy } => mouse.move_relative(*dx, *dy)?,
             Action::MouseMoveTo { x, y } => {
                 if let Some(cursor) = cursor.as_deref_mut() {
@@ -569,6 +583,14 @@ fn validate_actions(actions: &[Action]) -> Result<()> {
     }
     for action in actions {
         match action {
+            Action::FocusWindow { class } => {
+                if class.trim().is_empty() || class.len() > 256 || class.contains('\0') {
+                    bail!("policy window class must contain 1..256 bytes without NUL");
+                }
+                if actions.len() != 1 {
+                    bail!("focus_window must be followed by a fresh observation, not more actions");
+                }
+            }
             Action::MouseMove { dx, dy }
                 if dx.unsigned_abs() > 32_767 || dy.unsigned_abs() > 32_767 =>
             {
@@ -807,6 +829,47 @@ mod tests {
     }
 
     #[test]
+    fn window_activation_is_a_standalone_observed_action() {
+        let focus = Action::FocusWindow {
+            class: "firefox".into(),
+        };
+        assert!(validate_actions(std::slice::from_ref(&focus)).is_ok());
+        for class in ["", " ", "firefox\0terminal", &"x".repeat(257)] {
+            assert!(
+                validate_actions(&[Action::FocusWindow {
+                    class: class.into()
+                }])
+                .is_err()
+            );
+        }
+
+        let mut mouse_events = Vec::new();
+        let mut key_events = Vec::new();
+        let mut mouse = Controller::new(RecordingMouse(&mut mouse_events));
+        let mut keyboard = KeyboardController::new(RecordingKeyboard(&mut key_events));
+        let mut cursor = ObservedCursor {
+            reads: 0,
+            fail_after: 0,
+        };
+        let error = execute_actions(
+            &mut mouse,
+            &mut keyboard,
+            Some(&mut cursor),
+            &[
+                focus,
+                Action::Hotkey {
+                    keys: "ctrl+l".into(),
+                },
+            ],
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("fresh observation"));
+        assert!(mouse_events.is_empty());
+        assert!(key_events.is_empty());
+        assert_eq!(cursor.reads, 0);
+    }
+
+    #[test]
     fn targeted_move_verifies_arrival_and_logs_feedback_before_clicking() {
         let mut mouse_events = Vec::new();
         let mut key_events = Vec::new();
@@ -846,6 +909,7 @@ mod tests {
             reward: 0.0,
             completed: false,
             executed: true,
+            rationale: String::new(),
             cursor_motion: motion,
         })
         .unwrap();
