@@ -213,13 +213,9 @@ else
   ffmpeg_args+=(
     -c:v libx264
     -preset veryfast
-    -pix_fmt yuv420p
   )
 fi
 ffmpeg_args+=(
-  -g 60
-  -movflags +empty_moov+default_base_moof+frag_keyframe
-  -flush_packets 1
   "$output"
   -map 0:v
   -vf fps=2

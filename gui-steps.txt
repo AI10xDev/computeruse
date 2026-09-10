@@ -1,5 +1,4 @@
-Use the existing Firefox window. If it is not active, activate it with focus_window(class="firefox") and observe the result; do not toggle its taskbar button, use Alt+Tab, or change its size.
-Navigate directly to realestate.com.au using Ctrl+L, then type the URL and press Enter once the address bar is focused. A Restore Session error page does not need to be restored first.
+click on firefox and type realestate.com.au in the url bar & hit enter
 go on the page and click on the rent button 
 click on the search bar and click onto "Any Location"
 Then click onto Filter and in the AI Search Beta  (type & search Sydney)

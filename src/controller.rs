@@ -16,9 +16,6 @@ pub trait CursorBackend {
     fn dimensions(&mut self) -> Result<(u16, u16)>;
     fn position(&mut self) -> Result<Point>;
     fn move_to(&mut self, position: Point) -> Result<()>;
-    fn focus_window(&mut self, _class: &str) -> Result<()> {
-        anyhow::bail!("window activation is not supported by this cursor backend")
-    }
 }
 
 /// Measured result of one normalized target-directed movement. Positions and
