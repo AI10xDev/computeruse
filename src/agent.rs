@@ -8,9 +8,10 @@ use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const MAX_FRAME_BYTES: u64 = 20 * 1024 * 1024;
+const INPUT_SETTLE_TIME: Duration = Duration::from_millis(200);
 
 #[derive(Clone, Debug)]
 pub struct Frame {
@@ -33,6 +34,8 @@ pub struct FrameSource {
     directory: PathBuf,
     seen: HashMap<PathBuf, FrameIdentity>,
     discarded_paths: HashSet<PathBuf>,
+    observe_after: Option<SystemTime>,
+    latest_observed: Option<SystemTime>,
     trajectory: VecDeque<Frame>,
     trajectory_len: usize,
 }
@@ -63,13 +66,16 @@ impl FrameSource {
             directory,
             seen: HashMap::new(),
             discarded_paths: HashSet::new(),
+            observe_after: None,
+            latest_observed: None,
             trajectory: VecDeque::new(),
             trajectory_len,
         })
     }
 
-    /// Drop prior visual context and ignore frames already published before this call.
+    /// Require a post-input observation, including frames published late by the encoder.
     pub fn discard_existing(&mut self) -> Result<()> {
+        self.observe_after = Some(SystemTime::now() + INPUT_SETTLE_TIME);
         for entry in fs::read_dir(&self.directory)? {
             let path = entry?.path();
             if media_type(&path).is_some() {
@@ -86,14 +92,15 @@ impl FrameSource {
             let paths = self.unseen_paths()?;
             if !paths.is_empty() {
                 let keep_from = paths.len().saturating_sub(self.trajectory_len);
-                for (path, identity) in &paths[..keep_from] {
+                for (path, identity, _) in &paths[..keep_from] {
                     self.seen.insert(path.clone(), *identity);
                 }
                 let mut loaded = false;
-                for (path, identity) in paths.into_iter().skip(keep_from) {
+                for (path, identity, observed) in paths.into_iter().skip(keep_from) {
                     match read_stable_frame(&path, identity)? {
                         Some(frame) => {
                             self.seen.insert(path, identity);
+                            self.latest_observed = observed;
                             self.trajectory.push_back(frame);
                             loaded = true;
                         }
@@ -107,29 +114,46 @@ impl FrameSource {
                     return Ok(Some(&self.trajectory));
                 }
             }
-            if Instant::now() >= deadline {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
                 return Ok(None);
             }
-            thread::sleep(Duration::from_millis(100));
+            thread::sleep(Duration::from_millis(20).min(remaining));
         }
     }
 
-    fn unseen_paths(&self) -> Result<Vec<(PathBuf, FrameIdentity)>> {
+    fn unseen_paths(&self) -> Result<Vec<(PathBuf, FrameIdentity, Option<SystemTime>)>> {
         let mut paths = fs::read_dir(&self.directory)?
             .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .filter(|path| media_type(path).is_some() && !self.discarded_paths.contains(path))
             .filter_map(|path| {
                 let metadata = fs::metadata(&path).ok()?;
                 let identity = FrameIdentity {
                     len: metadata.len(),
                     modified: metadata.modified().ok(),
                 };
-                (media_type(&path).is_some()
-                    && !self.discarded_paths.contains(&path)
-                    && self.seen.get(&path) != Some(&identity))
-                .then_some((path, identity))
+                // record.sh preserves X11 capture PTS in Unix microseconds. File mtime
+                // alone cannot detect a pre-click capture encoded after the click.
+                let observed = if let Some(timestamp) =
+                    path.file_stem()?.to_str()?.strip_prefix("frame-capture-")
+                {
+                    UNIX_EPOCH.checked_add(Duration::from_micros(timestamp.parse().ok()?))
+                } else {
+                    identity.modified
+                };
+                if self
+                    .observe_after
+                    .is_some_and(|cutoff| observed.is_none_or(|observed| observed <= cutoff))
+                    || self
+                        .latest_observed
+                        .is_some_and(|latest| observed.is_none_or(|observed| observed < latest))
+                {
+                    return None;
+                }
+                (self.seen.get(&path) != Some(&identity)).then_some((path, identity, observed))
             })
             .collect::<Vec<_>>();
-        paths.sort_by_cached_key(|(path, identity)| (identity.modified, path.clone()));
+        paths.sort_by_cached_key(|(path, _, observed)| (*observed, path.clone()));
         Ok(paths)
     }
 }
@@ -269,6 +293,7 @@ pub struct Transition {
     pub step: usize,
     pub frame: PathBuf,
     pub actions: Vec<Action>,
+    pub rationale: String,
     pub progress: f32,
     pub reward: f32,
     pub completed: bool,
@@ -397,17 +422,22 @@ impl Policy for GptAstraPolicy {
             "Only the newest frame represents the current state; earlier frames are historical. ",
             "Previous transitions with executed=true record actions already sent, not instructions to replay. ",
             "Do not retype executed keys just because visual feedback is delayed; wait for a fresh observation before correcting input. ",
+            "Taskbar buttons toggle windows: clicking the active browser's taskbar button minimizes it. If the browser is already foreground, do not click its taskbar button or use alt+tab to focus it again. ",
+            "After activating a window, verify the newest observation shows that window foreground before typing. For browser navigation, focus its address bar with ctrl+l, not its taskbar button. Never type a URL into a terminal. ",
             "Use mouse_move_to for precision targets. Its coordinates are normalized 0..65535, NOT screenshot pixels: x=round(pixel_x*65535/(width-1)), y=round(pixel_y*65535/(height-1)). ",
             "mouse_move uses raw device counts, which are not screen pixels and can be affected by acceleration. ",
             "When present, cursor_motion reports measured desktop pixels, residual error, and velocity in pixels/second. Cursor arrival does not prove a click or page change succeeded. ",
-            "Prefer one small, reversible action per observation for navigation; reduce scroll increments as the target approaches rather than repeating large scrolls. ",
+            "Batch actions whose targets are already established by the current observation; do not request another decision between deterministic parts of one interaction. ",
+            "To click a visible target, return mouse_move_to followed by mouse_click in the SAME decision. The local executor verifies cursor arrival before clicking in proportional mode; no remote decision is needed between them. ",
+            "For hover-triggered menus or targets that may move on hover, move first and observe before clicking. Stop the batch after navigation or focus changes, and observe before choosing new targets or typing. ",
+            "Reduce scroll increments as the target approaches rather than repeating large scrolls. Do not add fixed waits after every action; the executor requires a new frame after a short post-input settling interval. This does not guarantee navigation has finished; use wait when the latest observation shows the application still needs time. ",
             "For known text in a focused field, use key_sequence to batch typing in one decision instead of requesting a decision for every letter. ",
             "Each sequence entry is a named key or hotkey, tapped once in order without observation delays. Preserve intentional repeated letters. ",
             "For example, {\"type\":\"key_sequence\",\"keys\":[\"h\",\"e\",\"l\",\"l\",\"o\",\"dot\"]} types hello. on a matching keyboard layout. ",
             "When the instructions explicitly request typing a known URL or query and pressing Enter, include enter as the final key in that same sequence; do not spend a separate observation on submission. ",
             "Observe focus changes before typing; do not combine navigation and speculative typing in one sequence. ",
             "Never invent an action type. Set completed only when the latest frame visibly proves the instructions are complete. ",
-            "Output: {\"rationale\":string,\"actions\":[action],\"completed\":bool,\"progress\":number}. ",
+            "Keep rationale to one short sentence. Output: {\"rationale\":string,\"actions\":[action],\"completed\":bool,\"progress\":number}. ",
             "Every action must be a flat object with a required \"type\" field, for example {\"type\":\"mouse_move_to\",\"x\":32768,\"y\":32768} targets the desktop center; do not use {\"mouse_move_to\":{...}}. ",
             "Valid type/field sets: mouse_move(dx,dy), mouse_move_to(x,y), mouse_click(button), scroll(delta,horizontal), key_tap(key), hotkey(keys), key_sequence(keys), wait(milliseconds). ",
             "Buttons: left, right, middle, side, extra. Named keys and hotkeys use forms such as enter, tab, escape, ctrl+shift+a. ",
@@ -678,10 +708,81 @@ mod tests {
 
         let fresh = directory.join("002.png");
         fs::write(&fresh, fake_png(b'f')).unwrap();
+        File::options()
+            .write(true)
+            .open(&fresh)
+            .unwrap()
+            .set_modified(source.observe_after.unwrap() + Duration::from_secs(1))
+            .unwrap();
         let trajectory = source.next(Duration::ZERO).unwrap().unwrap();
         assert_eq!(trajectory.len(), 1);
         assert_eq!(trajectory.back().unwrap().path, fresh);
 
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn capture_timestamps_reject_backlog_and_order_by_capture_not_publication() {
+        let directory = std::env::temp_dir().join(format!(
+            "computeruse-capture-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&directory).unwrap();
+        let mut source = FrameSource::new(&directory, 3).unwrap();
+        source.discard_existing().unwrap();
+        let cutoff = source
+            .observe_after
+            .unwrap()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_micros() as u64;
+        let publish = |micros, marker| {
+            let path = directory.join(format!("frame-capture-{micros:020}.png"));
+            fs::write(&path, fake_png(marker)).unwrap();
+            path
+        };
+        // Both arrive after the barrier but depict the desktop before it settled.
+        publish(cutoff - 200_001, b's');
+        publish(cutoff, b's');
+        fs::write(directory.join("frame-capture-invalid.png"), fake_png(b's')).unwrap();
+        assert!(source.next(Duration::ZERO).unwrap().is_none());
+
+        let newest = publish(cutoff + 3, b'n');
+        let earlier = publish(cutoff + 1, b'e');
+        File::options()
+            .write(true)
+            .open(&earlier)
+            .unwrap()
+            .set_modified(SystemTime::now() + Duration::from_secs(1))
+            .unwrap();
+        let trajectory = source.next(Duration::ZERO).unwrap().unwrap();
+        assert_eq!(trajectory.len(), 2);
+        assert_eq!(trajectory[0].path, earlier);
+        assert_eq!(trajectory[1].path, newest);
+        publish(cutoff + 2, b'd');
+        assert!(source.next(Duration::ZERO).unwrap().is_none());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn frame_source_rejects_late_atomic_publication_without_capture_timestamp() {
+        let directory = std::env::temp_dir().join(format!(
+            "computeruse-late-frame-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&directory).unwrap();
+        let temporary = directory.join("001.png.tmp");
+        fs::write(&temporary, fake_png(b's')).unwrap();
+        let mut source = FrameSource::new(&directory, 1).unwrap();
+        source.discard_existing().unwrap();
+        fs::rename(temporary, directory.join("001.png")).unwrap();
+        assert!(source.next(Duration::ZERO).unwrap().is_none());
         fs::remove_dir_all(directory).unwrap();
     }
 

@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 const CLICK_HOLD_DURATION: Duration = Duration::from_millis(20);
 const CURSOR_POLL_INTERVAL: Duration = Duration::from_millis(16);
 const CURSOR_TIMEOUT: Duration = Duration::from_secs(2);
+const MAX_CURSOR_DURATION: Duration = Duration::from_secs(10);
 const CURSOR_TOLERANCE: f64 = 2.0;
 const MAX_CURSOR_STEP: f64 = 96.0;
 
@@ -33,9 +34,10 @@ pub struct CursorMotion {
 
 /// Proportionally approaches a normalized 0..=65535 target, with bounded pixel
 /// steps and short-horizon velocity damping. Requires two observations within
-/// two pixels of the target. The polling budget allows nominal travel time plus
-/// two seconds to settle. Backend calls must return promptly; this is not an I/O
-/// timeout. Errors prevent the caller from proceeding to a dependent click.
+/// two pixels of the target. Stops after two seconds without progress or nominal
+/// travel time plus ten seconds overall, allowing slow feedback while converging.
+/// Backend calls must return promptly; this is not an I/O timeout. Errors prevent
+/// the caller from proceeding to a dependent click.
 pub fn move_cursor_to(cursor: &mut dyn CursorBackend, x: u16, y: u16) -> Result<CursorMotion> {
     let started = Instant::now();
     move_cursor_to_with_clock(cursor, x, y, |delay| {
@@ -63,8 +65,11 @@ fn move_cursor_to_with_clock(
     let started = clock(Duration::ZERO);
     let distance =
         (f64::from(target.x) - f64::from(start.x)).hypot(f64::from(target.y) - f64::from(start.y));
-    let budget = CURSOR_TIMEOUT + CURSOR_POLL_INTERVAL * (distance / MAX_CURSOR_STEP).ceil() as u32;
+    let budget =
+        MAX_CURSOR_DURATION + CURSOR_POLL_INTERVAL * (distance / MAX_CURSOR_STEP).ceil() as u32;
     let mut now = started;
+    let mut last_progress = started;
+    let mut best_residual = distance;
     let mut estimate = CursorEstimate::new(start, now);
     let mut corrections = 0;
     let mut settled = 0;
@@ -84,16 +89,6 @@ fn move_cursor_to_with_clock(
             f64::from(target.y - position.y),
         ];
         let residual = error[0].hypot(error[1]);
-        ensure!(
-            now - started < budget,
-            "cursor did not settle at ({}, {}) within {} ms: observed ({}, {}), residual {residual:.2} pixels; remaining actions were not executed",
-            target.x,
-            target.y,
-            budget.as_millis(),
-            position.x,
-            position.y
-        );
-
         if residual <= CURSOR_TOLERANCE {
             settled += 1;
             if settled == 2 {
@@ -109,6 +104,28 @@ fn move_cursor_to_with_clock(
             }
         } else {
             settled = 0;
+        }
+
+        // Only a new best distance renews the stall timer; jitter must not keep
+        // a confined cursor alive indefinitely. Accept confirmed arrival first.
+        if best_residual - residual >= 1.0 {
+            best_residual = residual;
+            last_progress = now;
+        }
+        ensure!(
+            now - started < budget && now - last_progress < CURSOR_TIMEOUT,
+            "cursor did not settle at ({}, {}) after {} ms and {corrections} corrections: observed ({}, {}), residual {residual:.2} pixels; no progress for {} ms (stall limit {} ms, total limit {} ms); remaining actions were not executed",
+            target.x,
+            target.y,
+            (now - started).as_millis(),
+            position.x,
+            position.y,
+            (now - last_progress).as_millis(),
+            CURSOR_TIMEOUT.as_millis(),
+            budget.as_millis()
+        );
+
+        if residual > CURSOR_TOLERANCE {
             let predicted = estimate.predict(CURSOR_POLL_INTERVAL);
             // P control with velocity damping. Never command past the target or
             // reverse away from it merely because the short prediction overshoots.
@@ -452,6 +469,72 @@ mod tests {
         assert!(error.to_string().contains("did not settle"));
         assert!(!cursor.moves.is_empty());
         assert!(cursor.moves.len() < 150);
+    }
+
+    #[test]
+    fn slow_feedback_can_settle_while_making_progress() {
+        let mut cursor = FakeCursor::new(Point { x: 300, y: 300 }, (1920, 1080));
+        let mut now = Duration::ZERO;
+        let report = move_cursor_to_with_clock(&mut cursor, 8_504, 790, |delay| {
+            if !delay.is_zero() {
+                now += Duration::from_millis(500);
+            }
+            now
+        })
+        .unwrap();
+
+        assert_eq!(report.target, Point { x: 249, y: 13 });
+        assert!(report.elapsed_ms > 2_064.0);
+        assert!(report.residual_pixels <= CURSOR_TOLERANCE);
+        assert_eq!(report.estimate.velocity, [0.0, 0.0]);
+    }
+
+    #[test]
+    fn delayed_confirmation_accepts_observed_arrival() {
+        let mut cursor = FakeCursor::new(Point { x: 960, y: 540 }, (1920, 1080));
+        let mut now = Duration::ZERO;
+        let report = move_cursor_to_with_clock(&mut cursor, 32_768, 32_768, |delay| {
+            if !delay.is_zero() {
+                now += Duration::from_secs(3);
+            }
+            now
+        })
+        .unwrap();
+
+        assert!(cursor.moves.is_empty());
+        assert_eq!(report.elapsed_ms, 3_000.0);
+        assert_eq!(report.residual_pixels, 0.0);
+    }
+
+    #[test]
+    fn progress_followed_by_a_stall_still_times_out() {
+        let mut cursor = FakeCursor::new(Point { x: 300, y: 300 }, (1920, 1080));
+        cursor.observations = [Point { x: 300, y: 300 }, Point { x: 255, y: 36 }].into();
+        cursor.response = 0.0;
+        let error = simulate(&mut cursor, 8_504, 790).unwrap_err().to_string();
+
+        assert!(error.contains("did not settle"));
+        assert!(error.contains("observed (255, 36), residual 23.77 pixels"));
+        assert!(cursor.moves.len() < 150);
+    }
+
+    #[test]
+    fn continuous_small_progress_has_a_hard_timeout() {
+        let mut cursor = FakeCursor::new(Point { x: 0, y: 0 }, (1920, 1080));
+        cursor.observations = (0..100).map(|x| Point { x, y: 0 }).collect();
+        let mut now = Duration::ZERO;
+        let error = move_cursor_to_with_clock(&mut cursor, 65_535, 0, |delay| {
+            if !delay.is_zero() {
+                now += Duration::from_millis(500);
+            }
+            now
+        })
+        .unwrap_err();
+
+        assert!(error.to_string().contains("did not settle"));
+        assert!(now >= Duration::from_secs(10));
+        assert!(now < Duration::from_secs(11));
+        assert!(!cursor.observations.is_empty());
     }
 
     #[test]

@@ -15,6 +15,12 @@ computeruse_bin=${COMPUTERUSE_BIN:-computeruse}
 credentials_file=${COMPUTERUSE_CREDENTIALS:-$project_dir/ast}
 acceleration=${COMPUTERUSE_VIDEO_ACCEL:-auto}
 explicit_vaapi_device=${COMPUTERUSE_VAAPI_DEVICE:-}
+observation_fps=${COMPUTERUSE_OBSERVATION_FPS-10}
+
+if [[ ! "$observation_fps" =~ ^([1-9]|[12][0-9]|30)$ ]]; then
+  echo "Invalid COMPUTERUSE_OBSERVATION_FPS value '$observation_fps'; expected a positive integer from 1 to 30." >&2
+  exit 2
+fi
 
 case "$acceleration" in
   auto|vaapi|off) ;;
@@ -185,11 +191,13 @@ if [[ "$execute" == false ]]; then
   echo "Agent is in dry-run mode; add --execute to enable mouse and keyboard input." >&2
 fi
 
-echo "Recording $display to $output and sampling agent observations at 2 FPS."
+echo "Recording $display to $output at 30 FPS and sampling agent observations at $observation_fps FPS."
 ffmpeg_args=(
   -hide_banner
   -nostdin
   -n
+  # x11grab supplies Unix-microsecond capture PTS; do not rebase the input.
+  -copyts
 )
 if [[ -n "$vaapi_device" ]]; then
   ffmpeg_args+=(
@@ -205,22 +213,33 @@ ffmpeg_args+=(
 )
 if [[ -n "$vaapi_device" ]]; then
   ffmpeg_args+=(
-    -vf format=nv12,hwupload
+    -vf setpts=PTS-STARTPTS,format=nv12,hwupload
     -c:v h264_vaapi
     -qp 23
   )
 else
   ffmpeg_args+=(
+    -vf setpts=PTS-STARTPTS
     -c:v libx264
     -preset veryfast
   )
 fi
 ffmpeg_args+=(
+  # Flush recoverable fragments every ~2 seconds; no B-frame start-time offset.
+  -g 60
+  -bf 0
+  -movflags +frag_keyframe+empty_moov+default_base_moof
+  -flush_packets 1
   "$output"
   -map 0:v
-  -vf fps=2
+  # Select one capture per sampling interval without rewriting its original PTS.
+  -vf "select='isnan(prev_selected_t)+gt(floor(t*$observation_fps),floor(prev_selected_t*$observation_fps))'"
+  -fps_mode passthrough
+  -enc_time_base 1:1000000
+  -compression_level 1
+  -frame_pts 1
   -atomic_writing 1
-  "$frames/frame-%09d.png"
+  "$frames/frame-capture-%020d.png"
 )
 
 ffmpeg "${ffmpeg_args[@]}" &

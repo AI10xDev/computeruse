@@ -161,11 +161,21 @@ are preserved. For example:
 ```
 
 These are physical keys on the active keyboard layout, not Unicode text input.
-The agent reports policy-request and local input/action durations separately on
-stderr; input/action time includes explicit `wait` actions. This distinguishes
-model latency from slow event emission. When instructions explicitly request
-typing a known URL or query and pressing Enter, the policy is instructed to put
+The agent reports frame-wait, policy-request, local input/action, frame-discard,
+and total decision-cycle durations separately on stderr, along with raw image
+bytes (before base64 encoding). Input/action time includes explicit `wait`
+actions; policy time includes request preparation and response parsing. This
+distinguishes model latency from capture delays and slow event emission. When
+instructions explicitly request typing a known URL or query and pressing Enter, the policy is instructed to put
 `enter` last in the same key sequence, avoiding an unnecessary model round trip.
+
+For visible click targets, the policy is instructed to batch `mouse_move_to`
+and `mouse_click` in one decision. Cursor verification and the click run locally
+without a model request or screenshot wait between them. Hover-dependent targets
+still require an observation before clicking, and navigation/focus changes must
+be observed before choosing new targets or typing. Routine fixed waits are
+discouraged. The remote vision policy still requires a network request per
+decision; these changes remove unnecessary round trips, not model inference.
 
 ### Proportional Cursor Control
 
@@ -245,16 +255,30 @@ to the current desktop, even when local cursor arrival can be measured.
 ### Concurrent Recording And Agent
 
 `record.sh` runs one FFmpeg process that records the X11 display at 30 FPS while
-also sampling temporary observations at 2 FPS. The agent watches those images
-through `--frames`, but requests are serialized: Astra receives one bounded
-frame trajectory per policy decision, not a continuous 2 FPS stream. After an
-executed action, already-published frames and the in-memory screenshot history
-are discarded. The next decision waits for newly published images instead of
-reusing pre-action visual context. Publication does not guarantee the GUI has
+also sampling temporary observations at 10 FPS. Set `COMPUTERUSE_OBSERVATION_FPS`
+to an integer from 1 to 30 to trade capture cost against feedback latency. PNG
+observations use fast compression without changing resolution or image quality.
+The agent watches those images through `--frames`, but requests are serialized:
+Astra receives one bounded
+frame trajectory per policy decision, not a continuous 10 FPS stream. The live
+frame watcher polls every 20 ms, bounded by the remaining frame timeout. After
+an executed input batch, already-published frames and the in-memory screenshot
+history are discarded. The next decision requires an image captured at least
+200 ms after input finishes, allowing focus changes to render. `record.sh` names
+observations `frame-capture-<Unix microseconds>.png` using original X11 capture
+timestamps, so encoder backlog cannot masquerade as fresh feedback. Other frame
+producers may use this naming convention; ordinary filenames fall back to file
+modification time, which cannot detect capture-to-encoding delays. Empty and wait-only batches retain images
+published during the decision, avoiding an extra capture interval, but never
+reuse the same observation. Publication does not guarantee the GUI has
 finished rendering, so the policy is instructed to wait for delayed feedback
 rather than blindly retype executed keys. When the agent completes or
 fails, the script stops FFmpeg cleanly, finalizes the MP4, and removes the
-temporary images. The output path must not already exist.
+temporary images. Fragmented MP4 output flushes at keyframes (at most about two
+seconds apart at 30 FPS), keeping completed fragments playable after a forced
+termination; the unfinished fragment can still be lost. The output path must
+not already exist. JSONL transitions include the policy rationale to help
+diagnose repeated actions and focus mistakes.
 
 ```bash
 printf '%s\n' 'Open the browser settings page.' > gui-steps.txt

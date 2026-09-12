@@ -345,7 +345,15 @@ impl AgentFrameSource {
         }
     }
 
-    fn discard_live_frames(&mut self) -> Result<()> {
+    fn discard_live_frames(&mut self, actions: &[Action]) -> Result<()> {
+        // A no-op or wait-only batch has not invalidated observations arriving
+        // during the policy request. Keep them instead of waiting another frame.
+        if actions
+            .iter()
+            .all(|action| matches!(action, Action::Wait { .. }))
+        {
+            return Ok(());
+        }
         if let Self::Live(source) = self {
             source.discard_existing()?;
         }
@@ -454,6 +462,7 @@ fn run_agent(options: AgentOptions) -> Result<()> {
     };
 
     for step in 0..options.max_steps {
+        let step_started = Instant::now();
         let missing_frame_context = if frames.is_live() {
             format!(
                 "timed out after {} ms waiting for a new live frame at step {step}",
@@ -465,6 +474,8 @@ fn run_agent(options: AgentOptions) -> Result<()> {
         let trajectory = frames
             .next(options.frame_timeout)?
             .with_context(|| missing_frame_context)?;
+        let frame_elapsed = step_started.elapsed();
+        let image_bytes: usize = trajectory.iter().map(|frame| frame.bytes.len()).sum();
         let frame = trajectory
             .back()
             .expect("trajectory has a new frame")
@@ -473,27 +484,32 @@ fn run_agent(options: AgentOptions) -> Result<()> {
         let policy_started = Instant::now();
         let decision = policy.decide(&instructions, trajectory, &transitions)?;
         let policy_elapsed = policy_started.elapsed();
-        let (input_elapsed, cursor_motion) = if let Some((mouse, keyboard)) = &mut devices {
-            let input_started = Instant::now();
-            let motion = execute_actions(
-                mouse,
-                keyboard,
-                cursor
-                    .as_mut()
-                    .map(|cursor| cursor as &mut dyn CursorBackend),
-                &decision.actions,
-            )?;
-            let elapsed = input_started.elapsed();
-            frames.discard_live_frames()?;
-            (elapsed, motion)
-        } else {
-            validate_actions(&decision.actions)?;
-            (Duration::ZERO, Vec::new())
-        };
+        let (input_elapsed, discard_elapsed, cursor_motion) =
+            if let Some((mouse, keyboard)) = &mut devices {
+                let input_started = Instant::now();
+                let motion = execute_actions(
+                    mouse,
+                    keyboard,
+                    cursor
+                        .as_mut()
+                        .map(|cursor| cursor as &mut dyn CursorBackend),
+                    &decision.actions,
+                )?;
+                let elapsed = input_started.elapsed();
+                let discard_started = Instant::now();
+                frames.discard_live_frames(&decision.actions)?;
+                (elapsed, discard_started.elapsed(), motion)
+            } else {
+                validate_actions(&decision.actions)?;
+                (Duration::ZERO, Duration::ZERO, Vec::new())
+            };
         eprintln!(
-            "agent step {step}: policy={} ms, input={:.3} ms{}",
+            "agent step {step}: frame={} ms, policy={} ms, input={:.3} ms, discard={:.3} ms, total={} ms, images={image_bytes} bytes{}",
+            frame_elapsed.as_millis(),
             policy_elapsed.as_millis(),
             input_elapsed.as_secs_f64() * 1000.0,
+            discard_elapsed.as_secs_f64() * 1000.0,
+            step_started.elapsed().as_millis(),
             if options.execute { "" } else { " (dry run)" }
         );
         let progress = decision.progress.clamp(0.0, 1.0);
@@ -501,6 +517,7 @@ fn run_agent(options: AgentOptions) -> Result<()> {
             step,
             frame,
             actions: decision.actions,
+            rationale: decision.rationale,
             progress,
             reward: progress - previous_progress,
             completed: decision.completed,
@@ -807,6 +824,57 @@ mod tests {
     }
 
     #[test]
+    fn only_input_batches_discard_frames_published_during_a_decision() {
+        for actions in [
+            vec![],
+            vec![Action::Wait { milliseconds: 10 }],
+            vec![Action::KeyTap { key: "a".into() }],
+            vec![
+                Action::KeyTap { key: "a".into() },
+                Action::Wait { milliseconds: 10 },
+            ],
+        ] {
+            let directory = TemporaryFrameDirectory::new().unwrap();
+            let png = b"\x89PNG\r\n\x1a\n\0\0\0\0IEND\0\0\0\0";
+            fs::write(directory.path.join("001.png"), png).unwrap();
+            let mut frames = AgentFrameSource::Live(FrameSource::new(&directory.path, 1).unwrap());
+            frames.next(Duration::ZERO).unwrap().unwrap();
+            let during = directory.path.join("002.png");
+            fs::write(&during, png).unwrap();
+
+            frames.discard_live_frames(&actions).unwrap();
+            let next = frames.next(Duration::ZERO).unwrap();
+            if actions
+                .iter()
+                .any(|action| matches!(action, Action::KeyTap { .. }))
+            {
+                assert!(next.is_none(), "input requires a post-action frame");
+                let after = directory.path.join("003.png");
+                fs::write(&after, png).unwrap();
+                fs::File::options()
+                    .write(true)
+                    .open(&after)
+                    .unwrap()
+                    .set_modified(SystemTime::now() + Duration::from_secs(1))
+                    .unwrap();
+                assert_eq!(
+                    frames
+                        .next(Duration::ZERO)
+                        .unwrap()
+                        .unwrap()
+                        .back()
+                        .unwrap()
+                        .path,
+                    after
+                );
+            } else {
+                assert_eq!(next.unwrap().back().unwrap().path, during);
+            }
+            assert!(frames.next(Duration::ZERO).unwrap().is_none());
+        }
+    }
+
+    #[test]
     fn targeted_move_verifies_arrival_and_logs_feedback_before_clicking() {
         let mut mouse_events = Vec::new();
         let mut key_events = Vec::new();
@@ -842,6 +910,7 @@ mod tests {
             step: 0,
             frame: "frame.png".into(),
             actions: vec![],
+            rationale: "cursor reached target".into(),
             progress: 0.0,
             reward: 0.0,
             completed: false,
