@@ -1,0 +1,53 @@
+error `Requested video acceleration mode: auto
+VA-API recording unavailable; falling back to software encoding:
+  /dev/dri/renderD128: [VAAPI @ 0x5b1f597f8d00] Failed to initialise VAAPI connection: -1 (unknown libva error).
+Device creation failed: -5.
+Failed to set value '/dev/dri/renderD128' for option 'vaapi_device': Input/output error
+Error parsing global options: Input/output error
+Recording :0.0 to ./output.mp4 and sampling agent observations at 2 FPS.
+[x11grab @ 0x62e33e336040] Stream #0: not enough frames to estimate rate; consider increasing probesize
+Input #0, x11grab, from ':0.0':
+  Duration: N/A, start: 1789194705.506602, bitrate: 1990656 kb/s
+  Stream #0:0: Video: rawvideo (BGR[0] / 0x524742), bgr0, 1920x1080, 1990656 kb/s, 30 fps, 1000k tbr, 1000k tbn, start 1789194705.506602
+Stream mapping:
+  Stream #0:0 -> #0:0 (rawvideo (native) -> h264 (libx264))
+  Stream #0:0 -> #1:0 (rawvideo (native) -> png (native))
+[libx264 @ 0x62e33e340540] using cpu capabilities: MMX2 SSE2Fast SSSE3 SSE4.2 AVX FMA3 BMI2 AVX2
+[libx264 @ 0x62e33e340540] profile High 4:4:4 Predictive, level 4.0, 4:4:4, 8-bit
+[libx264 @ 0x62e33e340540] 264 - core 165 - H.264/MPEG-4 AVC codec - Copyleft 2003-2025 - http://www.videolan.org/x264.html - options: cabac=1 ref=1 deblock=1:0:0 analyse=0x3:0x113 me=hex subme=2 psy=1 psy_rd=1.00:0.00 mixed_ref=0 me_range=16 chroma_me=1 trellis=0 8x8dct=1 cqm=0 deadzone=21,11 fast_pskip=1 chroma_qp_offset=6 threads=6 lookahead_threads=2 sliced_threads=0 nr=0 decimate=1 interlaced=0 bluray_compat=0 constrained_intra=0 bframes=3 b_pyramid=2 b_adapt=1 b_bias=0 direct=1 weightb=1 open_gop=0 weightp=1 keyint=250 keyint_min=25 scenecut=40 intra_refresh=0 rc_lookahead=10 rc=crf mbtree=1 crf=23.0 qcomp=0.60 qpmin=0 qpmax=69 qpstep=4 ip_ratio=1.40 aq=1:1.00
+Output #0, mp4, to './output.mp4':
+  Metadata:
+    encoder         : Lavf62.3.100
+  Stream #0:0: Video: h264 (avc1 / 0x31637661), yuv444p(tv, progressive), 1920x1080, q=2-31, 30 fps, 15360 tbn
+    Metadata:
+      encoder         : Lavc62.11.100 libx264
+    Side data:
+      cpb: bitrate max/min/avg: 0/0/0 buffer size: 0 vbv_delay: N/A
+Output #1, image2, to '/tmp/computeruse-frames.zeOY9i/frame-%09d.png':
+  Metadata:
+    encoder         : Lavf62.3.100
+  Stream #1:0: Video: png, rgb24(pc, gbr/unknown/unknown, progressive), 1920x1080, q=2-31, 200 kb/s, 2 fps, 2 tbn
+    Metadata:
+      encoder         : Lavc62.11.100 png
+agent mouse control: proportional, 1920x1080 X11 desktop pixelste=N/A speed=N/A elapsed=0:00:00.50    
+Error: cursor did not settle at (249, 13) within 2064 ms: observed (255, 36), residual 23.77 pixels; remaining actions were not executed   
+[out#0/mp4 @ 0x62e33e33f980] video:122KiB audio:0KiB subtitle:0KiB other streams:0KiB global headers:0KiB muxing overhead: 1.250583%
+[out#1/image2 @ 0x62e33e341600] video:3659KiB audio:0KiB subtitle:0KiB other streams:0KiB global headers:0KiB muxing overhead: unknown
+frame=   50 fps=2.5 q=-1.0 Lq=-0.0 size=     123KiB time=00:00:12.23 bitrate=  82.4kbits/s dup=0 drop=5 speed=0.622x elapsed=0:00:19.66    
+[libx264 @ 0x62e33e340540] frame I:1     Avg QP: 6.32  size: 29754
+[libx264 @ 0x62e33e340540] frame P:13    Avg QP:21.38  size:  6787
+[libx264 @ 0x62e33e340540] frame B:36    Avg QP:28.39  size:   160
+[libx264 @ 0x62e33e340540] consecutive B-frames:  4.0%  0.0%  0.0% 96.0%
+[libx264 @ 0x62e33e340540] mb I  I16..4: 92.6%  1.3%  6.2%
+[libx264 @ 0x62e33e340540] mb P  I16..4:  1.4%  0.0%  0.5%  P16..4:  2.8%  0.1%  0.0%  0.0%  0.0%    skip:95.2%
+[libx264 @ 0x62e33e340540] mb B  I16..4:  0.0%  0.0%  0.0%  B16..8:  0.2%  0.0%  0.0%  direct: 0.1%  skip:99.6%  L0:58.1% L1:41.9% BI: 0.0%
+[libx264 @ 0x62e33e340540] 8x8 transform intra:1.5% inter:6.8%
+[libx264 @ 0x62e33e340540] coded y,u,v intra: 8.2% 1.3% 0.7% inter: 0.5% 0.1% 0.0%
+[libx264 @ 0x62e33e340540] i16 v,h,dc,p: 89% 10%  1%  0%
+[libx264 @ 0x62e33e340540] i8 v,h,dc,ddl,ddr,vr,hd,vl,hu:  4% 85%  8%  0%  0%  0%  1%  0%  3%
+[libx264 @ 0x62e33e340540] i4 v,h,dc,ddl,ddr,vr,hd,vl,hu: 25% 28% 22%  2%  4%  3%  6%  3%  8%
+[libx264 @ 0x62e33e340540] Weighted P-Frames: Y:0.0% UV:0.0%
+[libx264 @ 0x62e33e340540] kb/s:80.49
+Exiting normally, received signal 2.
+Agent exited with status 1; the recording was finalized.
+` - fix in dir source 

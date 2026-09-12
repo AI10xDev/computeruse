@@ -1,33 +1,62 @@
 # computeruse
 
-`computeruse` is a Rust library and command-line tool for global mouse and
-keyboard capture and control on Ubuntu. It is a Linux-focused refactor of
-[`boppreh/mouse`](https://github.com/boppreh/mouse) and
-[`boppreh/keyboard`](https://github.com/boppreh/keyboard) that uses the
-kernel's `evdev` and `uinput` interfaces for capture and injection, plus X11
-for deterministic record/play cursor calibration.
+**Vision-guided Linux desktop control with GPT-6-Astra.**
 
-The kernel interfaces work in both Xorg and Wayland sessions and are suitable
-for Ubuntu 26.04. Record/play cursor calibration specifically requires X11.
+`computeruse` is a Rust command-line tool and library that connects visual
+reasoning to real mouse and keyboard input. Give it a task in a text file and
+desktop screenshots: GPT-6-Astra interprets the screen, selects GUI actions,
+and checks subsequent observations for progress. Use it to interact with
+applications, evaluate decisions against recorded sessions, or build your own
+computer-use workflow.
+
+The default model identifier is `gpt-6-astra`. Model inference runs through a
+remote API; screenshot handling, action validation, and input execution run
+locally. The agent prints decisions without controlling the desktop unless
+you explicitly pass `--execute`.
+
+The recommended live workflow uses native X11 on Linux, including Ubuntu 26.04.
+Lower-level input control also supports Wayland through `evdev` and `uinput`,
+but verified cursor positioning and the included screen-recording script
+require X11.
+
+## How Computer Use Works
+
+1. **Observe:** capture the desktop with `record.sh`, watch an existing image
+   directory, or sample frames from a prerecorded video.
+2. **Decide:** send the task, a bounded screenshot history, and previous
+   transitions to GPT-6-Astra for the next batch of typed actions.
+3. **Act:** validate actions and optionally execute mouse movement, clicks,
+   scrolling, key taps, hotkeys, or key sequences locally.
+4. **Check:** in live execution, wait for fresh post-action screenshots before
+   making the next decision. Save JSONL transitions to inspect actions,
+   rationale, model-reported progress, and cursor feedback.
+
+This is a screenshot-driven feedback loop, not a fixed macro or a continuous
+video stream to the model. Each decision makes a separate network request.
 
 ## Features
 
-- Capture button, relative movement, vertical wheel, and horizontal wheel events.
-- Inject clicks, button presses, movement, scrolling, and drag operations.
-- Move to normalized absolute coordinates through a virtual absolute pointer.
-- Record events as portable JSON and replay them with timing and type filters.
-- Hook, record, replay, and inject keyboard keys and simultaneous hotkeys.
-- Splice videos into ordered PNG frames and retain a bounded visual trajectory.
-- Use an OpenAI-compatible gpt-Astra vision policy to propose or execute GUI actions.
-- Use the same functionality from the CLI or the Rust library.
-- Test high-level behavior without access to physical input hardware.
+- Turn natural-language GUI instructions into actions using GPT-6-Astra vision.
+- Run a live observe/act loop or evaluate decisions against prerecorded video.
+- Batch visible-target movement and clicks, or type key sequences, without a
+  model round trip between every local input event.
+- Verify cursor arrival with proportional X11 control before a following click.
+- Start in dry-run mode and explicitly opt into desktop input with `--execute`.
+- Record sessions and export JSONL traces for debugging and offline evaluation.
+- Capture, inject, record, and replay mouse and keyboard events independently
+  of the model through the CLI or reusable Rust library.
 
 ## Requirements
 
 - Linux with `evdev` and `uinput` enabled (standard in Ubuntu kernels).
-- An X11 session and a screen at least 961 by 541 pixels for mouse record/play calibration.
+- A native X11 session for `record.sh` and the agent's default verified cursor
+  control. Mouse record/play calibration also needs a screen at least 961 by
+  541 pixels.
 - Rust 1.88 or newer to build from source.
 - FFmpeg on `PATH` for video frame extraction and visual-agent processing.
+- `xdpyinfo` and `timeout` on `PATH` when using `record.sh`.
+- API credentials and an endpoint exposing `gpt-6-astra`, or a compatible
+  vision model selected with `--model`.
 - Read access to mouse devices under `/dev/input` for capture.
 - Write access to `/dev/uinput` for control.
 
@@ -64,82 +93,52 @@ cargo build --release
 ./target/release/computeruse --help
 ```
 
-## CLI
+## GPT-6-Astra Setup
+
+Configure an Azure Foundry project endpoint or Azure OpenAI endpoint:
 
 ```bash
-# Click and scroll.
-computeruse click left
-computeruse click right --count 2
-computeruse wheel -3
-
-# Relative movement, immediately or over 500 ms.
-computeruse move 100 -40
-computeruse move 100 -40 --duration-ms 500
-
-# Absolute movement uses normalized coordinates (0..=65535 on each axis).
-computeruse move-to 32768 32768
-
-# Print newline-delimited JSON events until interrupted.
-computeruse listen
-
-# Home the pointer to X11 pixel (960, 540), record until Escape is pressed, then home it
-# again and replay twice as fast.
-computeruse record session.json
-computeruse play session.json --speed 2
-
-# Replay only movement and wheel events.
-computeruse play session.json --no-buttons
-
-# Hook, send, record, and replay keyboard events.
-computeruse keyboard-listen
-computeruse hotkey 'ctrl+shift+a'
-computeruse keyboard-record keys.json --stop-key escape
-computeruse keyboard-play keys.json --speed 2
+export AZURE_OPENAI_API_KEY=...
+export AZURE_OPENAI_ENDPOINT=https://RESOURCE.services.ai.azure.com/api/projects/PROJECT
 ```
 
-Before capture starts, the `record` command queries the pointer through X11 and
-moves it to screen 0 pixel `(960, 540)`, making that position the origin for the
-recorded relative movement. Mouse buttons are captured through XInput2 so both
-physical clicks and libinput touchpad tap-to-click gestures are retained. The
-`play` command repeats and verifies the same calibration before replaying events.
-Both commands print the before and after locations in `xdotool getmouselocation`
-format. Press Escape to stop recording.
-The Escape event is not included because mouse recordings contain only mouse
-events. A speed of `0` replays events without delays.
+The Azure configuration uses the Responses API. When `AZURE_OPENAI_ENDPOINT`
+is unset, the agent instead uses `OPENAI_API_KEY` and an optional
+`OPENAI_BASE_URL` with the Chat Completions API. The endpoint must support image
+inputs and the agent's JSON-output request format.
 
-## Library
+`gpt-6-astra` is the configured default, not a guarantee that every endpoint
+exposes that model name. Pass `--model YOUR_DEPLOYMENT_NAME` if your endpoint
+uses a different name. No model weights run locally.
 
-```rust,no_run
-use computeruse::{Button, Controller, LinuxMouse};
+## Start A Computer-Use Session
 
-fn main() -> std::io::Result<()> {
-    let mut mouse = Controller::new(LinuxMouse::new()?);
-    mouse.click(Button::Left)?;
-    mouse.move_relative(100, 20)?;
-    mouse.wheel(-1)?;
-    Ok(())
-}
+From a local checkout, create an instruction file and preview the agent's
+decisions while recording the desktop:
+
+```bash
+printf '%s\n' 'Open the browser settings page.' > gui-steps.txt
+
+# Safe default: capture the screen and print decisions, without sending input.
+./record.sh ./preview.mp4 ./gui-steps.txt --model gpt-6-astra
+
+# Execute model-selected actions and save a decision trace.
+./record.sh ./session.mp4 ./gui-steps.txt \
+  --model gpt-6-astra \
+  --execute \
+  --trace ./trajectory.jsonl
 ```
 
-Listen to global events:
+Each output video path must be new. The script runs FFmpeg and the agent
+together, then finalizes the recording when the agent exits. Extra arguments
+are forwarded to `computeruse agent`; specifying the default model above is
+optional.
 
-```rust,no_run
-use computeruse::Listener;
+Screenshots are sent to the configured remote endpoint even in dry-run mode.
+Use a test desktop without sensitive information, and supervise execution:
+`--execute` sends real input to the active desktop, not a sandbox.
 
-fn main() -> std::io::Result<()> {
-    Listener::new()?.listen(|event| println!("{event:?}"))
-}
-```
-
-`Controller<B>` is generic over `MouseBackend`, allowing applications to use a
-fake backend in unit tests without opening `/dev/uinput`.
-
-`KeyboardController<B>` provides the equivalent keyboard abstraction. Key
-recordings retain the Linux scan code, normalized key name, up/down state,
-repeat marker, and timestamp. Hotkeys press keys in the listed order and
-release them in reverse order, matching `boppreh/keyboard` behavior.
-
-## Visual Agent
+## Agent Functionality
 
 The `agent` command evaluates GUI instructions from a text file against either
 a live frame directory supplied through `--frames` or a recorded video supplied
@@ -223,13 +222,9 @@ directory must not already contain files named `frame-*.png`:
 video-frames --frame ./recording.mp4 --output ./video-frames
 ```
 
-Set the Azure API key and either a Foundry project endpoint or Azure OpenAI
-endpoint:
+With API credentials configured, you can also run the agent directly:
 
 ```bash
-export AZURE_OPENAI_API_KEY=...
-export AZURE_OPENAI_ENDPOINT=https://RESOURCE.services.ai.azure.com/api/projects/PROJECT
-
 # Watch frames produced by a running screencast process.
 computeruse agent \
   --frames ./screencast-frames \
@@ -334,8 +329,9 @@ Offline extraction validates decoding against the input itself. In `auto`, a
 failed hardware decode removes its numbered partial frames and retries once in
 software while preserving unrelated files in the output directory.
 
-The default model is `gpt-6-astra`; override it with `--model` for the name
-exposed by your endpoint. Unless `--frame-output` is supplied, extracted frames
+### Execution Limits
+
+Unless `--frame-output` is supplied, extracted frames
 are kept in a temporary directory and removed when the command exits. The
 agent samples videos at 2 FPS and processes one sampled frame per step in
 offline mode. In live mode, `--frame-timeout-ms` controls how long it waits for
@@ -348,6 +344,67 @@ persistent holds. Each decision is limited to 16 actions, relative movement to
 This is an online visual policy/evaluation loop, not an in-process model
 trainer. The `Policy` trait and JSONL transitions are the integration points
 for a separate RL trainer or replay buffer.
+
+## Input CLI And Library
+
+The input layer can be used without a model or API credentials. It is a
+Linux-focused refactor of [`boppreh/mouse`](https://github.com/boppreh/mouse)
+and [`boppreh/keyboard`](https://github.com/boppreh/keyboard), using the kernel's
+`evdev` and `uinput` interfaces for capture and injection.
+
+```bash
+# Click, scroll, and move the pointer.
+computeruse click left
+computeruse click right --count 2
+computeruse wheel -3
+computeruse move 100 -40 --duration-ms 500
+
+# Absolute coordinates are normalized to 0..=65535 on each axis.
+computeruse move-to 32768 32768
+
+# Listen, record until Escape, and replay twice as fast.
+computeruse listen
+computeruse record session.json
+computeruse play session.json --speed 2
+computeruse play session.json --no-buttons
+
+# Hook, send, record, and replay keyboard events.
+computeruse keyboard-listen
+computeruse hotkey 'ctrl+shift+a'
+computeruse keyboard-record keys.json --stop-key escape
+computeruse keyboard-play keys.json --speed 2
+```
+
+Before capture starts, `record` queries the pointer through X11 and moves it
+to screen 0 pixel `(960, 540)`, making that position the origin for recorded
+relative movement. Mouse buttons are captured through XInput2 so physical
+clicks and libinput touchpad tap-to-click gestures are retained. `play` repeats
+and verifies the same calibration. Both commands print the before and after
+locations in `xdotool getmouselocation` format. Mouse recordings contain only
+mouse events, so the Escape stop key is not included. A replay speed of `0`
+removes delays.
+
+Use the same input primitives from Rust:
+
+```rust,no_run
+use computeruse::{Button, Controller, LinuxMouse};
+
+fn main() -> std::io::Result<()> {
+    let mut mouse = Controller::new(LinuxMouse::new()?);
+    mouse.click(Button::Left)?;
+    mouse.move_relative(100, 20)?;
+    mouse.wheel(-1)?;
+    Ok(())
+}
+```
+
+`Listener::new()?.listen(|event| println!("{event:?}"))` listens to global mouse
+events. `Controller<B>` is generic over `MouseBackend`, allowing applications
+to use a fake backend in unit tests without opening `/dev/uinput`.
+`KeyboardController<B>` provides the equivalent keyboard abstraction. Key
+recordings retain scan codes, normalized names, up/down state, repeat markers,
+and timestamps. Hotkeys press keys in order and release them in reverse order.
+The `Policy` trait lets applications integrate their own decision policy.
 
 ## Wayland And Coordinates
 
