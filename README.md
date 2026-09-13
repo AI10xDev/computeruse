@@ -249,10 +249,11 @@ to the current desktop, even when local cursor arrival can be measured.
 
 ### Concurrent Recording And Agent
 
-`record.sh` runs one FFmpeg process that records the X11 display at 30 FPS while
-also sampling temporary observations at 10 FPS. Set `COMPUTERUSE_OBSERVATION_FPS`
-to an integer from 1 to 30 to trade capture cost against feedback latency. PNG
-observations use fast compression without changing resolution or image quality.
+`record.sh` runs separate FFmpeg processes to record the X11 display at 30 FPS
+and capture temporary observations at 10 FPS, so recording backpressure does not
+block observation capture. Set `COMPUTERUSE_OBSERVATION_FPS` to an integer from
+1 to 30 to control the observation capture rate independently of the recording.
+PNG observations use fast compression without changing resolution or image quality.
 The agent watches those images through `--frames`, but requests are serialized:
 Astra receives one bounded
 frame trajectory per policy decision, not a continuous 10 FPS stream. The live
@@ -267,9 +268,12 @@ modification time, which cannot detect capture-to-encoding delays. Empty and wai
 published during the decision, avoiding an extra capture interval, but never
 reuse the same observation. Publication does not guarantee the GUI has
 finished rendering, so the policy is instructed to wait for delayed feedback
-rather than blindly retype executed keys. When the agent completes or
-fails, the script stops FFmpeg cleanly, finalizes the MP4, and removes the
-temporary images. Fragmented MP4 output flushes at keyframes (at most about two
+rather than blindly retype executed keys. The agent starts only after both a
+nonempty recording and a complete observation are available. If either capture
+process exits unexpectedly, the script stops the agent and the other capture
+process, retaining the partial recording. When the agent completes or fails,
+the script stops both FFmpeg processes cleanly, finalizes the MP4, and removes
+the temporary images. Fragmented MP4 output flushes at keyframes (at most about two
 seconds apart at 30 FPS), keeping completed fragments playable after a forced
 termination; the unfinished fragment can still be lost. The output path must
 not already exist. JSONL transitions include the policy rationale to help

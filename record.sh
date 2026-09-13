@@ -67,7 +67,8 @@ if [[ -z "$size" ]]; then
 fi
 
 frames=$(mktemp -d "${TMPDIR:-/tmp}/computeruse-frames.XXXXXX")
-ffmpeg_pid=
+recording_pid=
+observation_pid=
 pruner_pid=
 agent_pid=
 
@@ -99,7 +100,8 @@ stop_child() {
 cleanup() {
   trap - EXIT
   stop_child "$agent_pid" TERM
-  stop_child "$ffmpeg_pid" INT
+  stop_child "$observation_pid" TERM
+  stop_child "$recording_pid" INT
   stop_child "$pruner_pid" TERM
   rm -rf -- "$frames"
 }
@@ -107,9 +109,28 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
+check_captures() {
+  local phase=$1
+  local capture pid_variable pid status
+  for capture in recording observation; do
+    pid_variable=${capture}_pid
+    pid=${!pid_variable}
+    if ! kill -0 "$pid" 2>/dev/null; then
+      if wait "$pid"; then
+        status=0
+      else
+        status=$?
+      fi
+      printf -v "$pid_variable" '%s' ''
+      echo "FFmpeg $capture process exited with status $status $phase; the partial recording was retained." >&2
+      exit 1
+    fi
+  done
+}
+
 prune_frames() {
   shopt -s nullglob
-  while kill -0 "$ffmpeg_pid" 2>/dev/null; do
+  while kill -0 "$observation_pid" 2>/dev/null; do
     local frame_files=("$frames"/frame-*.png)
     local excess=$((${#frame_files[@]} - 20))
     if (( excess > 0 )); then
@@ -191,8 +212,8 @@ if [[ "$execute" == false ]]; then
   echo "Agent is in dry-run mode; add --execute to enable mouse and keyboard input." >&2
 fi
 
-echo "Recording $display to $output at 30 FPS and sampling agent observations at $observation_fps FPS."
-ffmpeg_args=(
+echo "Recording $display to $output at 30 FPS and capturing agent observations separately at $observation_fps FPS."
+recording_args=(
   -hide_banner
   -nostdin
   -n
@@ -200,11 +221,11 @@ ffmpeg_args=(
   -copyts
 )
 if [[ -n "$vaapi_device" ]]; then
-  ffmpeg_args+=(
+  recording_args+=(
     -vaapi_device "$vaapi_device"
   )
 fi
-ffmpeg_args+=(
+recording_args+=(
   -f x11grab
   -framerate 30
   -video_size "$size"
@@ -212,61 +233,55 @@ ffmpeg_args+=(
   -map 0:v
 )
 if [[ -n "$vaapi_device" ]]; then
-  ffmpeg_args+=(
+  recording_args+=(
     -vf setpts=PTS-STARTPTS,format=nv12,hwupload
     -c:v h264_vaapi
     -qp 23
   )
 else
-  ffmpeg_args+=(
+  recording_args+=(
     -vf setpts=PTS-STARTPTS
     -c:v libx264
     -preset veryfast
   )
 fi
-ffmpeg_args+=(
+recording_args+=(
   # Flush recoverable fragments every ~2 seconds; no B-frame start-time offset.
   -g 60
   -bf 0
   -movflags +frag_keyframe+empty_moov+default_base_moof
   -flush_packets 1
   "$output"
-  -map 0:v
-  # Select one capture per sampling interval without rewriting its original PTS.
-  -vf "select='isnan(prev_selected_t)+gt(floor(t*$observation_fps),floor(prev_selected_t*$observation_fps))'"
-  -fps_mode passthrough
-  -enc_time_base 1:1000000
-  -compression_level 1
-  -frame_pts 1
-  -atomic_writing 1
-  "$frames/frame-capture-%020d.png"
 )
 
-ffmpeg "${ffmpeg_args[@]}" &
-ffmpeg_pid=$!
+ffmpeg "${recording_args[@]}" &
+recording_pid=$!
+
+# Capture independently so recording backpressure cannot delay observations.
+# Keep the original Unix-microsecond capture PTS, not a resampled FPS time grid.
+ffmpeg \
+  -hide_banner -nostdin -n -copyts \
+  -f x11grab -framerate "$observation_fps" -video_size "$size" -i "$display" \
+  -map 0:v -fps_mode passthrough -enc_time_base 1:1000000 \
+  -compression_level 1 -frame_pts 1 -atomic_writing 1 \
+  "$frames/frame-capture-%020d.png" &
+observation_pid=$!
 
 ready=false
 for (( attempt = 0; attempt < 100; attempt++ )); do
-  if ! kill -0 "$ffmpeg_pid" 2>/dev/null; then
-    if wait "$ffmpeg_pid"; then
-      ffmpeg_status=0
-    else
-      ffmpeg_status=$?
-    fi
-    ffmpeg_pid=
-    echo "FFmpeg exited with status $ffmpeg_status before producing the first complete observation." >&2
-    exit 1
+  check_captures "before capture was ready"
+  if [[ -s "$output" ]]; then
+    for frame in "$frames"/frame-*.png; do
+      if [[ -s "$frame" ]]; then
+        ready=true
+        break 2
+      fi
+    done
   fi
-  for frame in "$frames"/frame-*.png; do
-    if [[ -s "$frame" ]]; then
-      ready=true
-      break 2
-    fi
-  done
   sleep 0.1
 done
 if [[ "$ready" != true ]]; then
-  echo "Timed out waiting for FFmpeg to produce the first observation." >&2
+  echo "Timed out waiting for FFmpeg to produce the recording and first observation." >&2
   exit 1
 fi
 
@@ -278,24 +293,23 @@ pruner_pid=$!
   "$@" &
 agent_pid=$!
 
-if wait -n -p completed_pid "$agent_pid" "$ffmpeg_pid"; then
-  completed_status=0
+# Poll both workers: wait -n can miss a child that exited before the wait began.
+while kill -0 "$agent_pid" 2>/dev/null; do
+  check_captures "while the agent was running"
+  sleep 0.1
+done
+check_captures "while the agent was running"
+
+if wait "$agent_pid"; then
+  agent_status=0
 else
-  completed_status=$?
+  agent_status=$?
 fi
-
-if [[ "$completed_pid" == "$ffmpeg_pid" ]]; then
-  ffmpeg_pid=
-  stop_child "$agent_pid" TERM
-  agent_pid=
-  echo "FFmpeg exited with status $completed_status while the agent was running; the partial recording was retained." >&2
-  exit 1
-fi
-
-agent_status=$completed_status
 agent_pid=
-stop_child "$ffmpeg_pid" INT
-ffmpeg_pid=
+stop_child "$observation_pid" TERM
+observation_pid=
+stop_child "$recording_pid" INT
+recording_pid=
 stop_child "$pruner_pid" TERM
 pruner_pid=
 
