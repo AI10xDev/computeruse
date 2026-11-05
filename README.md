@@ -19,6 +19,12 @@ Lower-level input control also supports Wayland through `evdev` and `uinput`,
 but verified cursor positioning and the included screen-recording script
 require X11.
 
+**Arch Linux / Wayland:** version 0.2.0 includes a user-local installer and a
+separate `computeruse-wayland` live screenshot launcher for grim-compatible
+compositors such as Sway. See the [Arch Wayland setup guide](docs/ARCH-WAYLAND.md)
+for installation, permissions, supported environments, and limitations. This is
+not GNOME/KDE portal support or verified Wayland cursor positioning.
+
 ## How Computer Use Works
 
 1. **Observe:** capture the desktop with `record.sh`, watch an existing image

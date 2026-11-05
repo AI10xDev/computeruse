@@ -21,6 +21,21 @@ jobs:
       - run: cargo clippy --all-targets --all-features -- -D warnings
       - run: cargo test --all-targets --all-features
       - run: cargo doc --no-deps
+      - name: Installer and Wayland launcher tests
+        run: |
+          bash -n scripts/install-arch-wayland.sh
+          python3 -B -m unittest discover -s tests -p 'test_*.py' -v
+
+  arch-linux:
+    name: Arch Linux build (no compositor)
+    runs-on: ubuntu-24.04
+    container: archlinux:base-devel
+    steps:
+      - name: Install dependencies with a full upgrade
+        run: pacman -Syu --noconfirm --needed git rust python grim ffmpeg
+      - uses: actions/checkout@v5
+      - run: cargo test --locked --all-targets --all-features
+      - run: python -B -m unittest discover -s tests -p 'test_*.py' -v
 
   ubuntu-26-04:
     name: Ubuntu 26.04 build
