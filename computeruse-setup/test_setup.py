@@ -4,11 +4,12 @@ import io
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import tempfile
 import threading
 import unittest
-from unittest.mock import call, patch
+from unittest.mock import patch
 
 
 spec = importlib.util.spec_from_file_location("setup_wizard", Path(__file__).with_name("setup.py"))
@@ -85,20 +86,22 @@ class SetupTests(unittest.TestCase):
             self.assertTrue(text.endswith(f"[{'stopped' if error else 'done'}] Checking\n"))
 
     def test_no_animation_flag_reaches_progress(self):
-        with patch.object(wizard, "preferences", return_value={}), patch.object(wizard, "ask", return_value="yes"), patch.object(wizard, "source_bundle", return_value=[]), patch.object(wizard, "progress") as progress, contextlib.redirect_stdout(io.StringIO()):
-            progress.return_value.__enter__.return_value = False
+        with patch.object(wizard, "preferences", return_value={}), patch.object(wizard, "ask", return_value="yes"), patch.object(wizard, "source_bundle", return_value=[]), patch.object(wizard, "launch") as launch, patch.object(wizard, "progress") as progress, contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(wizard.main(["--dry-run", "--no-animation"]), 0)
-        self.assertEqual(progress.call_args_list, [
-            call("Launching setup wizard", enabled=False),
-            call("Fetching pinned GitHub sources", enabled=False),
-        ])
+        launch.assert_called_once_with(enabled=False)
+        progress.assert_called_once_with("Fetching pinned GitHub sources", enabled=False)
 
     def test_launch_animation_finishes_before_preferences(self):
         output = io.StringIO()
         with contextlib.redirect_stdout(output), contextlib.redirect_stderr(output), patch.object(output, "isatty", return_value=True), patch.object(wizard.sys.stdin, "isatty", return_value=True), patch.dict(os.environ, {"TERM": "xterm"}), patch.object(wizard.time, "sleep") as sleep, patch.object(wizard, "preferences") as preferences, patch.object(wizard, "ask", return_value="no"):
             def check_launch():
-                sleep.assert_called_once_with(0.6)
-                self.assertIn("[done] Launching setup wizard", output.getvalue())
+                self.assertGreater(sleep.call_count, 1)
+                duration = sum(call.args[0] for call in sleep.call_args_list)
+                self.assertGreaterEqual(duration, 1.0)
+                self.assertLessEqual(duration, 1.5)
+                plain = re.sub(r"\x1b\[[0-9;]*m", "", output.getvalue())
+                self.assertIn("[ READY ]", plain)
+                self.assertIn("C O M P U T E R U S E", plain)
                 self.assertFalse(any(t.name == "computeruse-progress" for t in threading.enumerate()))
                 return {}
 
@@ -126,14 +129,80 @@ class SetupTests(unittest.TestCase):
             self.assertEqual(wizard.main(["--dry-run"]), 130)
             preferences.assert_not_called()
             fetch.assert_not_called()
-        self.assertIn("[stopped] Launching setup wizard", output.getvalue())
+        self.assertIn("[stopped] Launch intro", output.getvalue())
+        self.assertNotIn("[ READY ]", output.getvalue())
         self.assertFalse(any(t.name == "computeruse-progress" for t in threading.enumerate()))
 
     def test_help_does_not_launch_animation(self):
-        with contextlib.redirect_stdout(io.StringIO()), patch.object(wizard, "progress") as progress, self.assertRaises(SystemExit) as exit:
+        with contextlib.redirect_stdout(io.StringIO()), patch.object(wizard, "launch") as launch, patch.object(wizard, "progress") as progress, self.assertRaises(SystemExit) as exit:
             wizard.main(["--help"])
         self.assertEqual(exit.exception.code, 0)
+        launch.assert_not_called()
         progress.assert_not_called()
+
+    def test_launch_colors_and_monochrome(self):
+        for term, no_color, expected in [("xterm-256color", False, "\x1b[38;5;51m"), ("xterm", False, "\x1b[96m"), ("xterm-256color", True, None)]:
+            output = io.StringIO()
+            env = {"TERM": term, **({"NO_COLOR": "1"} if no_color else {})}
+            with self.subTest(term=term, no_color=no_color), contextlib.redirect_stderr(output), patch.object(output, "isatty", return_value=True), patch.object(wizard.sys.stdin, "isatty", return_value=True), patch.object(wizard.sys.stdout, "isatty", return_value=True), patch.dict(os.environ, env, clear=True), patch.object(wizard.time, "sleep"):
+                wizard.launch()
+            text = output.getvalue()
+            if expected:
+                self.assertIn(expected, text)
+                self.assertIn("\x1b[92m", text)
+                self.assertIn("\x1b[0m", text)
+            else:
+                self.assertNotIn("\x1b", text)
+            plain = re.sub(r"\x1b\[[0-9;]*m", "", text)
+            self.assertIn("[>...........................]", plain)
+            self.assertIn("[.====>......................]", plain)
+            self.assertIn("[ READY ]", plain)
+
+    def test_launch_clips_before_ansi_styling(self):
+        for columns in (8, 32, 80):
+            output = io.StringIO()
+            with self.subTest(columns=columns), contextlib.redirect_stderr(output), patch.object(output, "isatty", return_value=True), patch.object(wizard.sys.stdin, "isatty", return_value=True), patch.object(wizard.sys.stdout, "isatty", return_value=True), patch.dict(os.environ, {"TERM": "xterm-256color"}, clear=True), patch.object(wizard.shutil, "get_terminal_size", return_value=os.terminal_size((columns, 24))), patch.object(wizard.time, "sleep"):
+                wizard.launch()
+            plain = re.sub(r"\x1b\[[0-9;]*m", "", output.getvalue())
+            self.assertTrue(all(len(line) < columns for line in plain.splitlines()))
+
+    def test_launch_resets_color_on_interrupt(self):
+        output = io.StringIO()
+        with contextlib.redirect_stderr(output), patch.object(output, "isatty", return_value=True), patch.object(wizard.sys.stdin, "isatty", return_value=True), patch.object(wizard.sys.stdout, "isatty", return_value=True), patch.dict(os.environ, {"TERM": "xterm-256color"}, clear=True), patch.object(wizard.time, "sleep", side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                wizard.launch()
+        self.assertTrue(output.getvalue().endswith("\x1b[0m\r[stopped] Launch intro\n"))
+
+    def test_launch_resets_color_after_partial_ready_write(self):
+        class InterruptedTerminal(io.StringIO):
+            interrupted = False
+
+            def isatty(self):
+                return True
+
+            def write(self, text):
+                if "\x1b[92m" in text and not self.interrupted:
+                    self.interrupted = True
+                    super().write("\x1b[92m[ RE")
+                    raise KeyboardInterrupt
+                return super().write(text)
+
+        output = InterruptedTerminal()
+        with contextlib.redirect_stderr(output), patch.object(wizard.sys.stdin, "isatty", return_value=True), patch.object(wizard.sys.stdout, "isatty", return_value=True), patch.dict(os.environ, {"TERM": "xterm-256color"}, clear=True), patch.object(wizard.time, "sleep"):
+            with self.assertRaises(KeyboardInterrupt):
+                wizard.launch()
+        self.assertIn("\x1b[92m[ RE\x1b[0m", output.getvalue())
+        self.assertTrue(output.getvalue().endswith("\x1b[0m\r[stopped] Launch intro\n"))
+
+    def test_launch_stops_motion_when_terminal_resizes(self):
+        output = io.StringIO()
+        with contextlib.redirect_stderr(output), patch.object(output, "isatty", return_value=True), patch.object(wizard.sys.stdin, "isatty", return_value=True), patch.object(wizard.sys.stdout, "isatty", return_value=True), patch.dict(os.environ, {"TERM": "xterm", "NO_COLOR": "1"}, clear=True), patch.object(wizard.shutil, "get_terminal_size") as size, patch.object(wizard.time, "sleep") as sleep:
+            size.return_value = os.terminal_size((80, 24))
+            sleep.side_effect = lambda _: setattr(size, "return_value", os.terminal_size((32, 24)))
+            wizard.launch()
+        sleep.assert_called_once()
+        self.assertIn("\n\n\n\r", output.getvalue())
+        self.assertIn("[ READY ]", output.getvalue())
 
     def test_progress_cleans_up_interrupted_startup(self):
         original_start = threading.Thread.start

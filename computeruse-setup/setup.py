@@ -84,8 +84,76 @@ def progress(label, enabled=True):
         print(f"[{outcome}] {label}", file=sys.stderr, flush=True)
 
 
+def launch(enabled=True):
+    animated = (
+        enabled and sys.stdin.isatty() and sys.stdout.isatty()
+        and sys.stderr.isatty() and os.environ.get("TERM") != "dumb"
+    )
+    if not animated:
+        print("\n  COMPUTERUSE\n  GPT-Sol / setup planner\n", file=sys.stderr)
+        return
+
+    colors = "NO_COLOR" not in os.environ
+    extended = "256color" in os.environ.get("TERM", "") or os.environ.get("COLORTERM") in ("truecolor", "24bit")
+    palette = ("38;5;51", "38;5;45", "38;5;39", "38;5;99", "38;5;141", "38;5;183") if extended else ("96", "94", "95")
+    columns = shutil.get_terminal_size().columns
+    resized = False
+
+    def draw(text, newline=False, tone=None):
+        nonlocal columns, resized
+        current_columns = shutil.get_terminal_size().columns
+        if current_columns != columns:
+            # Reflow is terminal-specific: stop redrawing and finish below old frames.
+            old_width = max(1, min(68, columns - 1))
+            print("\n" * (old_width // max(1, current_columns) + 1), end="\r", file=sys.stderr)
+            columns, resized = current_columns, True
+        width = max(1, min(68, columns - 1))
+        text = text[:width].ljust(width)
+        if colors:
+            span = max(1, len(text.rstrip()))
+            text = "".join(
+                f"\x1b[{tone or palette[min(len(palette) - 1, i * len(palette) // span)]}m{char}"
+                for i, char in enumerate(text)
+            ) + "\x1b[0m"
+        print("\r" + text, end="\n" if newline else "", file=sys.stderr, flush=True)
+
+    complete = False
+    try:
+        print(file=sys.stderr)
+        draw("  " + "-" * 54, newline=True)
+        title = "  C O M P U T E R U S E"
+        for length in range(3, len(title) + 1):
+            draw(title[:length] + "_")
+            if resized:
+                break
+            time.sleep(0.025)
+        draw(title, newline=True)
+        draw("  GPT-Sol  /  SETUP PLANNER", newline=True, tone="90")
+        print(file=sys.stderr)
+        for position in range(28):
+            if resized:
+                break
+            bar = "".join(
+                ">" if i == position else "=" if position - 4 <= i < position else "."
+                for i in range(28)
+            )
+            draw(f"  [{bar}]  preparing your interview")
+            time.sleep(0.025)
+        draw("  [ READY ]  Your machine. Your choices.", newline=True, tone="92")
+        draw("  PLAN FIRST. NOTHING INSTALLS AUTOMATICALLY.", newline=True, tone="90")
+        draw("  " + "-" * 54, newline=True)
+        print(file=sys.stderr)
+        complete = True
+    finally:
+        if colors:
+            print("\x1b[0m", end="", file=sys.stderr, flush=True)
+        if not complete:
+            draw("")
+            print("\r", end="", file=sys.stderr)
+            print("[stopped] Launch intro", file=sys.stderr, flush=True)
+
+
 def preferences():
-    print("\n+--------------------------------------+\n| COMPUTERUSE / GPT-Sol setup planner   |\n+--------------------------------------+")
     print("Planning only: no installation, screenshots, or permission changes.")
     print("Answers and public source will be sent to GPT-Sol only after confirmation.")
     print("Do not enter credentials, sensitive paths, or private host details.")
@@ -242,9 +310,7 @@ def main(argv=None):
     if args.output and args.output.exists():
         parser.error("--output already exists; choose a new file")
     try:
-        with progress("Launching setup wizard", enabled=not args.no_animation) as animated:
-            if animated:
-                time.sleep(0.6)
+        launch(enabled=not args.no_animation)
         answers = preferences()
         if not args.dry_run:
             model = args.model or ask("Configured GPT-Sol provider/model ID (see opencode models)")

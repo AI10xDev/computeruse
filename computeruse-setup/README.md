@@ -91,11 +91,25 @@ For example, enter `2` or `wayland` here:
   > [unknown]: 2
 ```
 
-On launch, a brief **0.6-second ASCII spinner** introduces the wizard before its
-banner and first question. This is a visual introduction, not a system check;
-it does not fetch sources, contact a model, or change your installation.
+The launch intro reveals a **cyan-to-violet COMPUTERUSE title**, then sweeps a
+light bar across the terminal before settling into a green **READY** state.
+It takes about **1.2 seconds** and finishes before the first question. This is a
+visual introduction, not a system check; it does not fetch sources, contact a
+model, or change your installation. It uses a 256-color gradient when supported,
+with a basic ANSI-color fallback, and clips to narrow terminal widths.
+If the terminal is resized mid-intro, motion stops and the final header is printed
+below the existing frames rather than redrawing across reflowed lines.
 
-The same spinner cycles through `| / - \` while fetching GitHub sources and while
+For a monochrome intro, set `NO_COLOR=1` (motion remains enabled):
+
+```sh
+NO_COLOR=1 python3 computeruse-setup/setup.py
+```
+
+No screen clearing, cursor hiding, or raw keyboard mode is used. Colors reset
+after each frame and on Ctrl+C so the next prompt is not left styled.
+
+An ASCII spinner cycles through `| / - \` while fetching GitHub sources and while
 GPT-Sol generates the plan. It stops before the next input prompt; no animation
 runs while you type. Completion is marked `[done]`; errors or cancellation are
 marked `[stopped]`, not falsely reported as success. Status messages go to stderr,
