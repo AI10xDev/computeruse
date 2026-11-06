@@ -2,9 +2,11 @@ import contextlib
 import importlib.util
 import io
 import json
+import os
 from pathlib import Path
 import subprocess
 import tempfile
+import threading
 import unittest
 from unittest.mock import patch
 
@@ -15,6 +17,94 @@ spec.loader.exec_module(wizard)
 
 
 class SetupTests(unittest.TestCase):
+    def test_choice_numbers_names_and_yes_no_shortcuts(self):
+        for answer, expected in [("1", "yes"), ("2", "no"), ("YES", "yes"), ("y", "yes"), ("N", "no"), ("", "no")]:
+            with self.subTest(answer=answer), patch("builtins.input", return_value=answer), contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(wizard.ask("Consent", "no", ("yes", "no")), expected)
+
+    def test_choice_rejects_out_of_range_numbers(self):
+        output = io.StringIO()
+        with patch("builtins.input", side_effect=["0", "3", "2"]), contextlib.redirect_stdout(output):
+            self.assertEqual(wizard.ask("Consent", "no", ("yes", "no")), "no")
+        self.assertEqual(output.getvalue().count("Enter a listed number"), 2)
+        self.assertIn("2. no (default)", output.getvalue())
+
+    def test_free_text_preserves_case_and_numbers(self):
+        for answer in ("/home/User/MyApps", "2"):
+            with patch("builtins.input", return_value=answer), contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(wizard.ask("Prefix"), answer)
+
+    def test_preference_section_order(self):
+        output = io.StringIO()
+        with patch("builtins.input", return_value=""), contextlib.redirect_stdout(output):
+            answers = wizard.preferences()
+        titles = ["1/4  Target Machine", "2/4  Installation", "3/4  Access and Privacy", "4/4  Review and Consent"]
+        positions = [output.getvalue().index(title) for title in titles]
+        self.assertEqual(positions, sorted(positions))
+        self.assertEqual(len(answers), 12)
+
+    def test_progress_static_when_redirected_disabled_or_dumb(self):
+        for enabled, tty, term in [(True, False, "xterm"), (False, True, "xterm"), (True, True, "dumb")]:
+            output = io.StringIO()
+            with self.subTest(enabled=enabled, tty=tty, term=term), contextlib.redirect_stderr(output), patch.object(output, "isatty", return_value=tty), patch.object(wizard.sys.stdin, "isatty", return_value=tty), patch.object(wizard.sys.stdout, "isatty", return_value=tty), patch.dict(os.environ, {"TERM": term}), patch.object(wizard.threading, "Thread") as thread:
+                with wizard.progress("Checking", enabled=enabled):
+                    pass
+                thread.assert_not_called()
+            self.assertEqual(output.getvalue(), "[working] Checking\n[done] Checking\n")
+
+    def test_progress_stops_animation_on_success_error_and_interrupt(self):
+        class Terminal(io.StringIO):
+            def __init__(self):
+                super().__init__()
+                self.advanced = threading.Event()
+
+            def isatty(self):
+                return True
+
+            def write(self, text):
+                count = super().write(text)
+                if "[/]" in text:
+                    self.advanced.set()
+                return count
+
+        for error in (None, RuntimeError("failed"), KeyboardInterrupt()):
+            terminal = Terminal()
+            with self.subTest(error=error), contextlib.redirect_stderr(terminal), patch.object(wizard.sys.stdin, "isatty", return_value=True), patch.object(wizard.sys.stdout, "isatty", return_value=True), patch.dict(os.environ, {"TERM": "xterm"}), patch.object(wizard.threading, "Thread", wraps=threading.Thread) as thread:
+                expectation = self.assertRaises(type(error)) if error else contextlib.nullcontext()
+                with expectation:
+                    with wizard.progress("Checking"):
+                        self.assertTrue(terminal.advanced.wait(2), "Spinner did not advance")
+                        if error:
+                            raise error
+                thread.assert_called_once()
+                self.assertFalse(any(t.name == "computeruse-progress" for t in threading.enumerate()))
+            text = terminal.getvalue()
+            self.assertIn("[|]", text)
+            self.assertIn("[/]", text)
+            self.assertNotIn("\x1b", text)
+            self.assertTrue(text.endswith(f"[{'stopped' if error else 'done'}] Checking\n"))
+
+    def test_no_animation_flag_reaches_progress(self):
+        with patch.object(wizard, "preferences", return_value={}), patch.object(wizard, "ask", return_value="yes"), patch.object(wizard, "source_bundle", return_value=[]), patch.object(wizard, "progress") as progress, contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(wizard.main(["--dry-run", "--no-animation"]), 0)
+        progress.assert_called_once_with("Fetching pinned GitHub sources", enabled=False)
+
+    def test_progress_cleans_up_interrupted_startup(self):
+        original_start = threading.Thread.start
+        for start_worker in (False, True):
+            def interrupted_start(worker):
+                if start_worker:
+                    original_start(worker)
+                raise KeyboardInterrupt
+
+            output = io.StringIO()
+            with self.subTest(start_worker=start_worker), contextlib.redirect_stderr(output), patch.object(output, "isatty", return_value=True), patch.object(wizard.sys.stdin, "isatty", return_value=True), patch.object(wizard.sys.stdout, "isatty", return_value=True), patch.dict(os.environ, {"TERM": "xterm"}), patch.object(threading.Thread, "start", interrupted_start):
+                with self.assertRaises(KeyboardInterrupt):
+                    with wizard.progress("Checking"):
+                        self.fail("Interrupted startup must not enter context body")
+                self.assertFalse(any(t.name == "computeruse-progress" for t in threading.enumerate()))
+            self.assertTrue(output.getvalue().endswith("[stopped] Checking\n"))
+
     def test_choice_reprompts(self):
         with patch("builtins.input", side_effect=["maybe", "yes"]), contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(wizard.ask("Consent", "no", ("yes", "no")), "yes")

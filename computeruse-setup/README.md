@@ -64,6 +64,50 @@ To inspect the wizard's request without OpenCode or a model call, use
 `python3 computeruse-setup/setup.py --dry-run`. This downloads public sources after
 consent and prints a prompt, not an AI-generated installation plan.
 
+## CLI Input
+
+Start the interactive wizard from the repository root:
+
+```sh
+python3 computeruse-setup/setup.py --output /tmp/computeruse-install-plan.md
+```
+
+Prompts are grouped into **Target Machine**, **Installation**, **Access and
+Privacy**, and **Review and Consent**. Select a listed number or type the option
+name (case-insensitive). Free-text answers, such as paths and model IDs, retain
+their case. Press Enter to accept the displayed default, or Ctrl+C to cancel.
+Two-option yes/no questions also accept `y` and `n`.
+
+For example, enter `2` or `wayland` here:
+
+```text
+--- 1/4  Target Machine ---
+
+  Target display session
+    1. x11
+    2. wayland
+    3. headless
+    4. unknown (default)
+  > [unknown]: 2
+```
+
+An ASCII spinner cycles through `| / - \` while fetching GitHub sources and while
+GPT-Sol generates the plan. It stops before the next input prompt; no animation
+runs while you type. Completion is marked `[done]`; errors or cancellation are
+marked `[stopped]`, not falsely reported as success. Status messages go to stderr,
+not into the generated report. There are no extra Python dependencies.
+
+Disable animation explicitly for accessibility or a plain terminal:
+
+```sh
+python3 computeruse-setup/setup.py --no-animation --output /tmp/computeruse-install-plan.md
+```
+
+Animation is also disabled automatically if stdin, stdout, or stderr is not a TTY,
+or `TERM=dumb`. These modes still print static progress messages. Safe defaults
+and the separate fetch/model consent questions remain unchanged; choosing input
+permissions in the plan does not grant them or start an installation.
+
 ## Review Findings
 
 Reviewed upstream commit

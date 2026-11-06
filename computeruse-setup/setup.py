@@ -2,6 +2,8 @@
 """Collect installation preferences and request a read-only GPT-Sol setup plan."""
 
 import argparse
+from contextlib import contextmanager
+from itertools import cycle
 import json
 import os
 import platform
@@ -11,6 +13,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import urllib.error
 import urllib.request
 
@@ -25,16 +28,63 @@ SOURCES = (
 
 
 def ask(label, default=None, choices=()):
-    suffix = f" ({'/'.join(choices)})" if choices else ""
+    print(f"\n  {label}")
+    for number, choice in enumerate(choices, 1):
+        print(f"    {number}. {choice}" + (" (default)" if choice == default else ""))
     while True:
-        value = input(f"{label}{suffix}" + (f" [{default}]" if default else "") + ": ").strip()
+        value = input("  >" + (f" [{default}]" if default else "") + ": ").strip()
         value = value or default
+        if choices and value:
+            value = value.lower()
+            numbered = {str(i): choice for i, choice in enumerate(choices, 1)}
+            value = numbered.get(value, value)
+            if choices == ("yes", "no"):
+                value = {"y": "yes", "n": "no"}.get(value, value)
         if value and (not choices or value in choices):
             return value
-        print("Enter " + (", ".join(choices) if choices else "a nonempty value") + ".")
+        print("  Enter " + ("a listed number or " + ", ".join(choices) if choices else "a nonempty value") + ".")
+
+
+@contextmanager
+def progress(label, enabled=True):
+    """Animate only between prompts, leaving logs and terminal state intact."""
+    animated = (
+        enabled and sys.stdin.isatty() and sys.stdout.isatty()
+        and sys.stderr.isatty() and os.environ.get("TERM") != "dumb"
+    )
+    stopped = threading.Event()
+    worker = None
+    width = max(1, min(len(label) + 4, shutil.get_terminal_size().columns - 1))
+
+    def spin():
+        for frame in cycle("|/-\\"):
+            if stopped.is_set():
+                break
+            print("\r" + f"[{frame}] {label}"[:width], end="", file=sys.stderr, flush=True)
+            if stopped.wait(0.1):
+                break
+
+    outcome = "stopped"
+    try:
+        if animated:
+            worker = threading.Thread(target=spin, name="computeruse-progress", daemon=True)
+            worker.start()
+        else:
+            print(f"[working] {label}", file=sys.stderr, flush=True)
+        yield
+        outcome = "done"
+    finally:
+        stopped.set()
+        if worker is not None:
+            # Startup can be interrupted before the thread has actually started.
+            if worker.is_alive():
+                worker.join()
+            print("\r" + " " * width + "\r", end="", file=sys.stderr, flush=True)
+        print(f"[{outcome}] {label}", file=sys.stderr, flush=True)
 
 
 def preferences():
+    print("\n+--------------------------------------+\n| COMPUTERUSE / GPT-Sol setup planner   |\n+--------------------------------------+")
     print("Planning only: no installation, screenshots, or permission changes.")
     print("Answers and public source will be sent to GPT-Sol only after confirmation.")
     print("Do not enter credentials, sensitive paths, or private host details.")
@@ -44,21 +94,33 @@ def preferences():
             system = platform.freedesktop_os_release().get("PRETTY_NAME", system)
         except OSError:
             pass
-    result = {
-        "target_os": ask("Target OS and version (may differ from this host)", system),
-        "architecture": ask("Target architecture", platform.machine() or "unknown"),
-        "session": ask("Target display session", "unknown", ("x11", "wayland", "headless", "unknown")),
-        "desktop": ask("Desktop/compositor (e.g. Sway, GNOME, KDE)", "unknown"),
-        "method": ask("Install method", "source", ("source", "arch-installer", "undecided")),
-        "prefix": ask("Target install prefix (literal target path)", "~/.local"),
-        "packages": ask("May the plan include privileged package installation?", "no", ("yes", "no")),
-        "full_upgrade": ask("May the plan include a full Arch system upgrade?", "no", ("yes", "no")),
-        "input": ask("Desired use", "preview", ("preview", "control", "raw-recording")),
-        "input_permissions": ask("May the plan propose input permission changes?", "no", ("yes", "no")),
-        "remote_images": ask("May the eventual app send screenshots to a remote model?", "no", ("yes", "no", "undecided")),
-        "vision_provider": ask("Eventual vision API (separate from GPT-Sol builder)", "undecided", ("azure", "openai-compatible", "undecided")),
-    }
-    print("\nPreferences:\n" + json.dumps(result, indent=2))
+    print("Choose a number or name. Enter accepts the default. Ctrl+C cancels.")
+    sections = (
+        ("Target Machine", (
+            ("target_os", "Target OS and version (may differ from this host)", system),
+            ("architecture", "Target architecture", platform.machine() or "unknown"),
+            ("session", "Target display session", "unknown", ("x11", "wayland", "headless", "unknown")),
+            ("desktop", "Desktop/compositor (e.g. Sway, GNOME, KDE)", "unknown"),
+        )),
+        ("Installation", (
+            ("method", "Install method", "source", ("source", "arch-installer", "undecided")),
+            ("prefix", "Target install prefix (literal target path)", "~/.local"),
+            ("packages", "May the plan include privileged package installation?", "no", ("yes", "no")),
+            ("full_upgrade", "May the plan include a full Arch system upgrade?", "no", ("yes", "no")),
+        )),
+        ("Access and Privacy", (
+            ("input", "Desired use", "preview", ("preview", "control", "raw-recording")),
+            ("input_permissions", "May the plan propose input permission changes?", "no", ("yes", "no")),
+            ("remote_images", "May the eventual app send screenshots to a remote model?", "no", ("yes", "no", "undecided")),
+            ("vision_provider", "Eventual vision API (separate from GPT-Sol builder)", "undecided", ("azure", "openai-compatible", "undecided")),
+        )),
+    )
+    result = {}
+    for number, (title, questions) in enumerate(sections, 1):
+        print(f"\n--- {number}/4  {title} ---")
+        for key, *question in questions:
+            result[key] = ask(*question)
+    print("\n--- 4/4  Review and Consent ---\n" + json.dumps(result, indent=2))
     return result
 
 
@@ -168,6 +230,7 @@ def main(argv=None):
     parser.add_argument("--opencode", default="opencode", help="Trusted OpenCode executable")
     parser.add_argument("--revision", default=REVISION, help="Upstream 40-character commit SHA")
     parser.add_argument("--dry-run", action="store_true", help="Fetch public sources and preview prompt; no model call")
+    parser.add_argument("--no-animation", action="store_true", help="Use static progress messages instead of a terminal spinner")
     parser.add_argument("--output", type=Path, help="Write the prompt/report to a NEW file instead of stdout")
     parser.add_argument("--timeout", type=int, default=600, help="Builder timeout in seconds (default: 600)")
     args = parser.parse_args(argv)
@@ -189,7 +252,9 @@ def main(argv=None):
         if ask("Fetch pinned public GitHub sources?", "no", ("yes", "no")) != "yes":
             print("Cancelled; nothing fetched or installed.")
             return 0
-        prompt = make_prompt(answers, source_bundle(args.revision), args.revision)
+        with progress("Fetching pinned GitHub sources", enabled=not args.no_animation):
+            sources = source_bundle(args.revision)
+        prompt = make_prompt(answers, sources, args.revision)
         if args.dry_run:
             report = prompt
         else:
@@ -199,7 +264,8 @@ def main(argv=None):
             if ask("Send preferences, sources, and global OpenCode context to this model?", "no", ("yes", "no")) != "yes":
                 print("Cancelled; no model request or installation.")
                 return 0
-            report = run_builder(prompt, model, executable, args.timeout)
+            with progress("GPT-Sol is reviewing setup", enabled=not args.no_animation):
+                report = run_builder(prompt, model, executable, args.timeout)
         if args.output:
             with args.output.open("x", encoding="utf-8") as output:
                 output.write(report + "\n")
