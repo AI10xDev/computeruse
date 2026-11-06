@@ -4,6 +4,66 @@ Interactive Python 3.10+ wizard for reviewing `AI10xDev/computeruse` installatio
 with an OpenCode **build** agent backed by your configured **GPT-Sol** deployment.
 It produces a plan, not an automatic installer. No Python dependencies are needed.
 
+## How to Install
+
+**`setup.py` helps you plan the installation; it does not install computeruse.**
+Do not use `pip install .`, `python setup.py install`, or `sudo python3 setup.py`.
+This is an interactive wizard, not a Python packaging script.
+
+1. Get the repository and open a terminal in its root directory:
+
+```sh
+git clone https://github.com/AI10xDev/computeruse.git
+cd computeruse
+python3 --version
+```
+
+Use Python 3.10 or newer. If you already have this checkout, use it instead of
+cloning again. Commands below assume you are in the repository root.
+
+2. Install/configure OpenCode with your GPT-Sol deployment as described under
+   [Usage](#usage), then generate your installation plan:
+
+```sh
+python3 computeruse-setup/setup.py --output /tmp/computeruse-install-plan.md
+```
+
+Answer the OS, desktop, installation, and permission questions. When prompted for
+the model, enter your actual OpenCode `provider/model` ID for GPT-Sol, not the
+literal name `GPT-Sol`. Answer `yes` to fetching sources, and only approve sending
+context to the model after reviewing the consent notice. Both default to `no`.
+Choose a new output filename if the file already exists.
+
+3. Open `/tmp/computeruse-install-plan.md`, resolve any compatibility warnings,
+   and manually run only the installation commands you have reviewed and approved.
+   The Markdown report is not a shell script; do not execute it with `bash`.
+
+For example, if the plan confirms a Linux source installation and you already
+have Rust >=1.88 and the required build tools, install the Rust binaries as your
+regular user with:
+
+```sh
+cargo install --locked --git https://github.com/AI10xDev/computeruse.git \
+  --rev 59f4c98a5fe10a7da91a853068738c7883485359 --root "$HOME/.local"
+export PATH="$HOME/.local/bin:$PATH"
+computeruse --version
+computeruse --help
+```
+
+This installs the pinned Rust binaries only, not system dependencies, `record.sh`,
+the Wayland launcher, API credentials, or input permissions. For Arch/Wayland,
+follow the [Arch installer guide](../docs/ARCH-WAYLAND.md#install) instead if that
+is your selected route. Its default package step performs a full system upgrade.
+
+4. Follow the plan's capture, endpoint, and permission checks for your actual
+   desktop before starting a GUI session. A successful `--help` is not a desktop
+   test. Start without `--execute`; even preview sessions send screenshots to the
+   vision endpoint. Never run the agent as root.
+
+To inspect the wizard's request without OpenCode or a model call, use
+`python3 computeruse-setup/setup.py --dry-run`. This downloads public sources after
+consent and prints a prompt, not an AI-generated installation plan.
+
 ## Review Findings
 
 Reviewed upstream commit

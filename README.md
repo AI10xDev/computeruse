@@ -88,6 +88,11 @@ trusted users and services.
 
 For a short setup walkthrough, see [`QUICKSTART.md`](QUICKSTART.md).
 
+For a GPT-Sol-guided installation plan tailored to your OS, desktop, and permission
+preferences, see [How to Install with the setup wizard](computeruse-setup/README.md#how-to-install).
+The wizard generates reviewable instructions; it does not install packages or
+change system permissions automatically.
+
 ```bash
 cargo install --git https://github.com/AI10xDev/computeruse
 ```
