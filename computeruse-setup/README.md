@@ -91,7 +91,11 @@ For example, enter `2` or `wayland` here:
   > [unknown]: 2
 ```
 
-An ASCII spinner cycles through `| / - \` while fetching GitHub sources and while
+On launch, a brief **0.6-second ASCII spinner** introduces the wizard before its
+banner and first question. This is a visual introduction, not a system check;
+it does not fetch sources, contact a model, or change your installation.
+
+The same spinner cycles through `| / - \` while fetching GitHub sources and while
 GPT-Sol generates the plan. It stops before the next input prompt; no animation
 runs while you type. Completion is marked `[done]`; errors or cancellation are
 marked `[stopped]`, not falsely reported as success. Status messages go to stderr,
@@ -104,7 +108,8 @@ python3 computeruse-setup/setup.py --no-animation --output /tmp/computeruse-inst
 ```
 
 Animation is also disabled automatically if stdin, stdout, or stderr is not a TTY,
-or `TERM=dumb`. These modes still print static progress messages. Safe defaults
+or `TERM=dumb`. These modes skip the launch delay and still print static progress
+messages. `--help` also runs immediately without animation. Safe defaults
 and the separate fetch/model consent questions remain unchanged; choosing input
 permissions in the plan does not grant them or start an installation.
 

@@ -8,7 +8,7 @@ import subprocess
 import tempfile
 import threading
 import unittest
-from unittest.mock import patch
+from unittest.mock import call, patch
 
 
 spec = importlib.util.spec_from_file_location("setup_wizard", Path(__file__).with_name("setup.py"))
@@ -86,8 +86,54 @@ class SetupTests(unittest.TestCase):
 
     def test_no_animation_flag_reaches_progress(self):
         with patch.object(wizard, "preferences", return_value={}), patch.object(wizard, "ask", return_value="yes"), patch.object(wizard, "source_bundle", return_value=[]), patch.object(wizard, "progress") as progress, contextlib.redirect_stdout(io.StringIO()):
+            progress.return_value.__enter__.return_value = False
             self.assertEqual(wizard.main(["--dry-run", "--no-animation"]), 0)
-        progress.assert_called_once_with("Fetching pinned GitHub sources", enabled=False)
+        self.assertEqual(progress.call_args_list, [
+            call("Launching setup wizard", enabled=False),
+            call("Fetching pinned GitHub sources", enabled=False),
+        ])
+
+    def test_launch_animation_finishes_before_preferences(self):
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output), contextlib.redirect_stderr(output), patch.object(output, "isatty", return_value=True), patch.object(wizard.sys.stdin, "isatty", return_value=True), patch.dict(os.environ, {"TERM": "xterm"}), patch.object(wizard.time, "sleep") as sleep, patch.object(wizard, "preferences") as preferences, patch.object(wizard, "ask", return_value="no"):
+            def check_launch():
+                sleep.assert_called_once_with(0.6)
+                self.assertIn("[done] Launching setup wizard", output.getvalue())
+                self.assertFalse(any(t.name == "computeruse-progress" for t in threading.enumerate()))
+                return {}
+
+            preferences.side_effect = check_launch
+            self.assertEqual(wizard.main(["--dry-run"]), 0)
+            preferences.assert_called_once()
+
+    def test_launch_skips_delay_without_animation(self):
+        cases = [(["--no-animation"], True, True, True, "xterm"),
+                 ([], False, True, True, "xterm"),
+                 ([], True, False, True, "xterm"),
+                 ([], True, True, False, "xterm"),
+                 ([], True, True, True, "dumb")]
+        for args, stdin_tty, stdout_tty, stderr_tty, term in cases:
+            stdout, stderr = io.StringIO(), io.StringIO()
+            with self.subTest(args=args, stdin=stdin_tty, stdout=stdout_tty, stderr=stderr_tty, term=term), contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr), patch.object(stdout, "isatty", return_value=stdout_tty), patch.object(stderr, "isatty", return_value=stderr_tty), patch.object(wizard.sys.stdin, "isatty", return_value=stdin_tty), patch.dict(os.environ, {"TERM": term}), patch.object(wizard.time, "sleep") as sleep, patch.object(wizard.threading, "Thread") as thread, patch.object(wizard, "preferences", return_value={}), patch.object(wizard, "ask", return_value="no"):
+                self.assertEqual(wizard.main(["--dry-run", *args]), 0)
+                sleep.assert_not_called()
+                thread.assert_not_called()
+                self.assertNotIn("\r", stderr.getvalue())
+
+    def test_cancel_during_launch_does_not_prompt_or_fetch(self):
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output), contextlib.redirect_stderr(output), patch.object(output, "isatty", return_value=True), patch.object(wizard.sys.stdin, "isatty", return_value=True), patch.dict(os.environ, {"TERM": "xterm"}), patch.object(wizard.time, "sleep", side_effect=KeyboardInterrupt), patch.object(wizard, "preferences") as preferences, patch.object(wizard, "source_bundle") as fetch:
+            self.assertEqual(wizard.main(["--dry-run"]), 130)
+            preferences.assert_not_called()
+            fetch.assert_not_called()
+        self.assertIn("[stopped] Launching setup wizard", output.getvalue())
+        self.assertFalse(any(t.name == "computeruse-progress" for t in threading.enumerate()))
+
+    def test_help_does_not_launch_animation(self):
+        with contextlib.redirect_stdout(io.StringIO()), patch.object(wizard, "progress") as progress, self.assertRaises(SystemExit) as exit:
+            wizard.main(["--help"])
+        self.assertEqual(exit.exception.code, 0)
+        progress.assert_not_called()
 
     def test_progress_cleans_up_interrupted_startup(self):
         original_start = threading.Thread.start

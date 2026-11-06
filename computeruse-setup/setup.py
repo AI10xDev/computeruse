@@ -14,6 +14,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import urllib.error
 import urllib.request
 
@@ -71,7 +72,7 @@ def progress(label, enabled=True):
             worker.start()
         else:
             print(f"[working] {label}", file=sys.stderr, flush=True)
-        yield
+        yield animated
         outcome = "done"
     finally:
         stopped.set()
@@ -230,7 +231,7 @@ def main(argv=None):
     parser.add_argument("--opencode", default="opencode", help="Trusted OpenCode executable")
     parser.add_argument("--revision", default=REVISION, help="Upstream 40-character commit SHA")
     parser.add_argument("--dry-run", action="store_true", help="Fetch public sources and preview prompt; no model call")
-    parser.add_argument("--no-animation", action="store_true", help="Use static progress messages instead of a terminal spinner")
+    parser.add_argument("--no-animation", action="store_true", help="Skip the launch animation and use static progress messages")
     parser.add_argument("--output", type=Path, help="Write the prompt/report to a NEW file instead of stdout")
     parser.add_argument("--timeout", type=int, default=600, help="Builder timeout in seconds (default: 600)")
     args = parser.parse_args(argv)
@@ -241,6 +242,9 @@ def main(argv=None):
     if args.output and args.output.exists():
         parser.error("--output already exists; choose a new file")
     try:
+        with progress("Launching setup wizard", enabled=not args.no_animation) as animated:
+            if animated:
+                time.sleep(0.6)
         answers = preferences()
         if not args.dry_run:
             model = args.model or ask("Configured GPT-Sol provider/model ID (see opencode models)")
